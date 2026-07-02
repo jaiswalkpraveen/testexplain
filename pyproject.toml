@@ -1,0 +1,29 @@
+[project]
+name = "testlens"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "anthropic>=0.34",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "typer>=0.12",
+]
+
+[project.scripts]
+testlens = "testlens.cli:app"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/testlens"]
