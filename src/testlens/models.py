@@ -1,4 +1,21 @@
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+# The only category values the LLM is allowed to answer with.
+# Literal = "exactly one of these strings, nothing else".
+# If the LLM invents "network issue", validation fails loudly
+# instead of silently corrupting downstream filters/counts.
+Category = Literal[
+    "product bug",
+    "api outage",
+    "environment",
+    "infrastructure",
+    "network",
+    "automation bug",
+    "flaky",
+    "unknown",
+]
 
 
 class FailureContext(BaseModel):
@@ -12,6 +29,16 @@ class FailureContext(BaseModel):
 
 
 class FailureAnalysis(BaseModel):
-    """M0: plain-English explanation. Becomes structured in M1."""
+    """M1: structured triage verdict for one failed test.
+
+    Every field is machine-usable: you can filter by category,
+    sort by confidence, and render evidence/next_steps as lists --
+    none of which was possible with M0's free-text explanation.
+    """
+
     test_title: str
-    explanation: str
+    summary: str  # 1-2 sentence plain-English explanation
+    suspected_category: Category
+    evidence: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)  # 0 = guessing, 1 = certain
