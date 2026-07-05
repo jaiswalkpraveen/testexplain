@@ -44,7 +44,18 @@ def analyze(report_path: str, fake: bool = False):
             raise typer.Exit(code=1)
 
     for analysis in analyze_report(report_path, gateway):
-        print(f"\n### {analysis.test_title}\n{analysis.explanation}")
+        print(f"\n### {analysis.test_title}")
+        print(f"[{analysis.suspected_category}] "
+              f"(confidence: {analysis.confidence:.0%})")
+        print(analysis.summary)
+        if analysis.evidence:
+            print("Evidence:")
+            for item in analysis.evidence:
+                print(f"  - {item}")
+        if analysis.next_steps:
+            print("Next steps:")
+            for step in analysis.next_steps:
+                print(f"  - {step}")
 
 
 if __name__ == "__main__":

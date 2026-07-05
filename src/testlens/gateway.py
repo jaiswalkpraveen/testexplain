@@ -20,6 +20,18 @@ class Gateway(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
+# Default canned reply: valid JSON matching the FailureAnalysis schema,
+# because that's what a well-behaved LLM now returns. "FAKE:" marks it
+# as fake in CLI/API output.
+_FAKE_JSON_REPLY = """{
+  "summary": "FAKE: test failed because of a timeout.",
+  "suspected_category": "flaky",
+  "evidence": ["Timeout 30000ms exceeded"],
+  "next_steps": ["Re-run the test", "Check for slow API responses"],
+  "confidence": 0.5
+}"""
+
+
 class FakeGateway:
     """Deterministic test double. No network, no API key.
 
@@ -27,7 +39,7 @@ class FakeGateway:
     can assert what was sent.
     """
 
-    def __init__(self, response: str = "FAKE: test failed because of a timeout.") -> None:
+    def __init__(self, response: str = _FAKE_JSON_REPLY) -> None:
         self.response = response
         self.calls: list[str] = []
 

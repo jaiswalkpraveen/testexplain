@@ -20,7 +20,9 @@ def test_analyze_endpoint_with_fake_gateway():
     assert isinstance(data, list)
     assert len(data) == 1
     assert data[0]["test_title"] == "user sees dashboard after login"
-    assert "FAKE:" in data[0]["explanation"]
+    assert "FAKE:" in data[0]["summary"]
+    assert data[0]["suspected_category"] == "flaky"
+    assert 0.0 <= data[0]["confidence"] <= 1.0
 
 
 def test_analyze_endpoint_returns_error_for_missing_file():

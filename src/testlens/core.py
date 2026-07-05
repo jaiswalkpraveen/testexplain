@@ -7,8 +7,11 @@ never on a concrete provider -- so tests pass FakeGateway and production
 passes AnthropicGateway with this code unchanged.
 """
 
+import json
 from pathlib import Path
 from typing import get_args
+
+from pydantic import ValidationError
 
 from testlens.gateway import Gateway
 from testlens.ingestion.playwright import parse_report
@@ -47,8 +50,48 @@ no markdown fences, no text before or after it -- with exactly these keys:
 - "confidence": a number between 0.0 and 1.0 for how sure you are"""
 
 
+def _strip_markdown_fences(text: str) -> str:
+    """Remove a ```json ... ``` (or plain ```) wrapper if present.
+
+    We told the LLM not to add fences, but instructions reduce misbehavior,
+    they don't eliminate it -- so we clean up defensively.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        first_newline = text.index("\n")  # end of the ```json line
+        text = text[first_newline + 1 :]  # drop the opening fence line
+        text = text.removesuffix("```").strip()
+    return text
+
+
+def parse_analysis(raw: str, test_title: str) -> FailureAnalysis:
+    """Turn the LLM's raw reply into a validated FailureAnalysis.
+
+    Two failure modes, one exception type (ValueError) for callers:
+    - the reply is not JSON at all (prose, apology, truncation)
+    - the reply is JSON but violates the schema (bad category, confidence
+      out of range, missing keys)
+
+    ``test_title`` is injected by US, not asked from the LLM -- never ask
+    the model for facts you already have.
+    """
+    cleaned = _strip_markdown_fences(raw)
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"LLM reply is not valid JSON: {exc}") from exc
+
+    data["test_title"] = test_title
+
+    try:
+        return FailureAnalysis(**data)
+    except ValidationError as exc:
+        raise ValueError(f"LLM reply violates the schema: {exc}") from exc
+
+
 def analyze_report(path: str | Path, gateway: Gateway) -> list[FailureAnalysis]:
-    """Run the full M0 pipeline: parse -> prompt -> generate -> wrap.
+    """Run the full pipeline: parse report -> prompt -> generate -> validate.
 
     ``gateway`` is typed as the Gateway Protocol, so this function never
     mentions FakeGateway or AnthropicGateway -- that is the seam payoff.
@@ -58,11 +101,6 @@ def analyze_report(path: str | Path, gateway: Gateway) -> list[FailureAnalysis]:
     analyses: list[FailureAnalysis] = []
     for failure in failures:
         prompt = build_prompt(failure)
-        explanation = gateway.generate(prompt)
-        analyses.append(
-            FailureAnalysis(
-                test_title=failure.test_title,
-                explanation=explanation,
-            )
-        )
+        raw = gateway.generate(prompt)
+        analyses.append(parse_analysis(raw, test_title=failure.test_title))
     return analyses
