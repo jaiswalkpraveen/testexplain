@@ -35,17 +35,29 @@ _FAKE_JSON_REPLY = """{
 class FakeGateway:
     """Deterministic test double. No network, no API key.
 
-    Returns a canned response and records every prompt it was given so tests
-    can assert what was sent.
+    Two modes:
+    - ``FakeGateway(response="...")`` -- same reply every call.
+    - ``FakeGateway(responses=["a", "b"])`` -- scripted: reply "a" on the
+      first call, "b" on the second. When the script is exhausted, the
+      last reply repeats (so an extra call never crashes a test for a
+      fake-internal reason).
+
+    Records every prompt in ``calls`` so tests can assert what was sent.
     """
 
-    def __init__(self, response: str = _FAKE_JSON_REPLY) -> None:
-        self.response = response
+    def __init__(
+        self,
+        response: str = _FAKE_JSON_REPLY,
+        responses: list[str] | None = None,
+    ) -> None:
+        self.responses = responses if responses is not None else [response]
         self.calls: list[str] = []
 
     def generate(self, prompt: str) -> str:
         self.calls.append(prompt)
-        return self.response
+        # Call 1 -> script[0], call 2 -> script[1], ... then repeat the last.
+        index = min(len(self.calls) - 1, len(self.responses) - 1)
+        return self.responses[index]
 
 
 class AnthropicGateway:

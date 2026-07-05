@@ -90,6 +90,41 @@ def parse_analysis(raw: str, test_title: str) -> FailureAnalysis:
         raise ValueError(f"LLM reply violates the schema: {exc}") from exc
 
 
+def generate_analysis(
+    gateway: Gateway,
+    prompt: str,
+    test_title: str,
+    max_attempts: int = 3,
+) -> FailureAnalysis:
+    """Ask the LLM for an analysis, retrying with feedback on bad replies.
+
+    The self-correction loop: unlike a flaky HTTP service, an LLM can FIX
+    its mistake if you tell it what was wrong. On a bad reply we re-prompt
+    with the exact validation error plus the original task, up to
+    ``max_attempts`` total calls. If every attempt fails, re-raise the
+    last error -- give up loudly, never silently.
+    """
+    last_error: ValueError | None = None
+    current_prompt = prompt
+
+    for _ in range(max_attempts):
+        raw = gateway.generate(current_prompt)
+        try:
+            return parse_analysis(raw, test_title=test_title)
+        except ValueError as exc:
+            last_error = exc
+            current_prompt = (
+                f"Your previous reply was invalid: {exc}\n\n"
+                f"Original task:\n{prompt}\n\n"
+                "Respond again with ONLY the corrected JSON object."
+            )
+
+    raise ValueError(
+        f"LLM failed to produce valid JSON after {max_attempts} attempts. "
+        f"Last error: {last_error}"
+    ) from last_error
+
+
 def analyze_report(path: str | Path, gateway: Gateway) -> list[FailureAnalysis]:
     """Run the full pipeline: parse report -> prompt -> generate -> validate.
 
@@ -101,6 +136,7 @@ def analyze_report(path: str | Path, gateway: Gateway) -> list[FailureAnalysis]:
     analyses: list[FailureAnalysis] = []
     for failure in failures:
         prompt = build_prompt(failure)
-        raw = gateway.generate(prompt)
-        analyses.append(parse_analysis(raw, test_title=failure.test_title))
+        analyses.append(
+            generate_analysis(gateway, prompt, test_title=failure.test_title)
+        )
     return analyses

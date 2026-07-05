@@ -3,7 +3,12 @@ from typing import get_args
 
 import pytest
 
-from testlens.core import analyze_report, build_prompt, parse_analysis
+from testlens.core import (
+    analyze_report,
+    build_prompt,
+    generate_analysis,
+    parse_analysis,
+)
 from testlens.gateway import FakeGateway
 from testlens.models import Category, FailureAnalysis, FailureContext
 
@@ -85,6 +90,47 @@ def test_parse_analysis_rejects_json_violating_schema():
 
     with pytest.raises(ValueError):
         parse_analysis(bad, test_title="t")
+
+
+def test_generate_analysis_returns_result_on_first_good_reply():
+    gateway = FakeGateway(response=VALID_JSON_REPLY)
+
+    analysis = generate_analysis(gateway, "the prompt", test_title="t")
+
+    assert analysis.suspected_category == "api outage"
+    # Happy path must cost exactly ONE llm call -- no wasted retries.
+    assert len(gateway.calls) == 1
+
+
+def test_generate_analysis_recovers_after_one_bad_reply():
+    gateway = FakeGateway(responses=["not json at all", VALID_JSON_REPLY])
+
+    analysis = generate_analysis(gateway, "the prompt", test_title="t")
+
+    assert analysis.suspected_category == "api outage"
+    assert len(gateway.calls) == 2
+
+
+def test_generate_analysis_repair_prompt_mentions_the_error():
+    gateway = FakeGateway(responses=["not json at all", VALID_JSON_REPLY])
+
+    generate_analysis(gateway, "the prompt", test_title="t")
+
+    repair_prompt = gateway.calls[1]
+    # The second prompt must tell the LLM its reply was invalid and why,
+    # and repeat the original task so it can actually retry.
+    assert "invalid" in repair_prompt.lower()
+    assert "JSON" in repair_prompt
+    assert "the prompt" in repair_prompt
+
+
+def test_generate_analysis_gives_up_after_max_attempts():
+    gateway = FakeGateway(responses=["garbage"])  # garbage forever
+
+    with pytest.raises(ValueError):
+        generate_analysis(gateway, "the prompt", test_title="t", max_attempts=3)
+
+    assert len(gateway.calls) == 3
 
 
 def test_analyze_report_runs_pipeline_with_fake_gateway():
