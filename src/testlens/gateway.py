@@ -60,6 +60,49 @@ class FakeGateway:
         return self.responses[index]
 
 
+class OpenAICompatibleGateway:
+    """Real gateway for any OpenAI-compatible endpoint.
+
+    Works with LLM routers (LiteLLM, OpenRouter, employer proxies...) and
+    self-hosted inference servers (vLLM, SGLang...) that expose the standard
+    ``/v1/chat/completions`` API. All connection details come from the
+    environment:
+
+    - ``LLM_BASE_URL`` -- the endpoint URL, e.g. http://192.168.0.247:8000/v1
+    - ``LLM_API_KEY`` -- the key for that endpoint. May be empty for
+      no-auth LAN endpoints (the variable must still be set); the OpenAI
+      client refuses empty strings, so a placeholder is sent instead.
+    - ``LLM_MODEL`` -- default model name, e.g. dspark
+
+    Imports ``openai`` lazily inside ``__init__`` (same reason as
+    AnthropicGateway: FakeGateway tests must not require the package).
+    Missing env vars raise ``KeyError`` at construction time -- fail fast,
+    not mid-request.
+    """
+
+    def __init__(self, model: str | None = None) -> None:
+        import os
+
+        from openai import OpenAI
+
+        self.model = model or os.environ["LLM_MODEL"]
+        self.client = OpenAI(
+            base_url=os.environ["LLM_BASE_URL"],
+            # "or" kicks in when the env var is set but empty (no-auth
+            # LAN endpoint): the client demands *some* string, the server
+            # never checks it.
+            api_key=os.environ["LLM_API_KEY"] or "unused",
+        )
+
+    def generate(self, prompt: str) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
+
+
 class AnthropicGateway:
     """Real gateway backed by Claude.
 

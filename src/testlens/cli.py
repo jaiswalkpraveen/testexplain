@@ -10,9 +10,14 @@ prints the explanations to the terminal.
 """
 
 import typer
+from dotenv import load_dotenv
 
 from testlens.core import analyze_report
-from testlens.gateway import AnthropicGateway, FakeGateway
+from testlens.gateway import FakeGateway, OpenAICompatibleGateway
+
+# Read .env from the project root into os.environ (no-op if absent),
+# so LLM_* vars work without exporting them in every shell.
+load_dotenv()
 
 app = typer.Typer()
 
@@ -34,11 +39,12 @@ def analyze(report_path: str, fake: bool = False):
         gateway = FakeGateway()
     else:
         try:
-            gateway = AnthropicGateway()
-        except KeyError:
+            gateway = OpenAICompatibleGateway()
+        except KeyError as exc:
             typer.echo(
-                "Error: ANTHROPIC_API_KEY is not set. "
-                "Export it, or run with --fake for a no-key dry run.",
+                f"Error: missing environment variable {exc}. "
+                "Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL "
+                "(e.g. in a .env file), or run with --fake for a no-key dry run.",
                 err=True,
             )
             raise typer.Exit(code=1)

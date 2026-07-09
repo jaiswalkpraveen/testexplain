@@ -13,11 +13,14 @@ are automatic.
 
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 
 from testlens.core import analyze_report
-from testlens.gateway import AnthropicGateway, FakeGateway
+from testlens.gateway import FakeGateway, OpenAICompatibleGateway
 from testlens.models import FailureAnalysis
+
+load_dotenv()
 
 app = FastAPI(title="TestLens", description="Explain why your tests failed.")
 
@@ -32,11 +35,12 @@ def analyze(report_path: str, fake: bool = False) -> list[FailureAnalysis]:
         gateway = FakeGateway()
     else:
         try:
-            gateway = AnthropicGateway()
-        except KeyError:
+            gateway = OpenAICompatibleGateway()
+        except KeyError as exc:
             raise HTTPException(
                 status_code=500,
-                detail="ANTHROPIC_API_KEY is not set. Use ?fake=true for a dry run.",
+                detail=f"Missing environment variable {exc}. "
+                "Set LLM_* vars or use ?fake=true for a dry run.",
             )
 
     return analyze_report(report_path, gateway)
