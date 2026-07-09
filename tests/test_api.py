@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from testlens.api import app
+from testexplain.api import app
 
 
 def test_analyze_endpoint_with_fake_gateway():

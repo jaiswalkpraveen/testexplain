@@ -1,6 +1,6 @@
 import pytest
 
-from testlens.gateway import FakeGateway, OpenAICompatibleGateway
+from testexplain.gateway import FakeGateway, OpenAICompatibleGateway
 
 
 def test_fake_gateway_returns_canned_response():

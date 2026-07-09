@@ -8,7 +8,7 @@ These tests pin down the new shape BEFORE we change models.py (TDD).
 import pytest
 from pydantic import ValidationError
 
-from testlens.models import FailureAnalysis
+from testexplain.models import FailureAnalysis
 
 
 def make_valid_kwargs() -> dict:

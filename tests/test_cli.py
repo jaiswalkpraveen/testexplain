@@ -2,7 +2,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from testlens.cli import app
+from testexplain.cli import app
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
 

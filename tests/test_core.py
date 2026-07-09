@@ -3,14 +3,14 @@ from typing import get_args
 
 import pytest
 
-from testlens.core import (
+from testexplain.core import (
     analyze_report,
     build_prompt,
     generate_analysis,
     parse_analysis,
 )
-from testlens.gateway import FakeGateway
-from testlens.models import Category, FailureAnalysis, FailureContext
+from testexplain.gateway import FakeGateway
+from testexplain.models import Category, FailureAnalysis, FailureContext
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
 

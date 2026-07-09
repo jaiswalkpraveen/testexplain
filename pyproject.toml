@@ -1,5 +1,5 @@
 [project]
-name = "testlens"
+name = "testexplain"
 version = "0.0.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -8,10 +8,12 @@ dependencies = [
     "fastapi>=0.111",
     "uvicorn>=0.30",
     "typer>=0.12",
+    "openai>=2.45.0",
+    "python-dotenv>=1.2.2",
 ]
 
 [project.scripts]
-testlens = "testlens.cli:app"
+testexplain = "testexplain.cli:app"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -26,4 +28,4 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/testlens"]
+packages = ["src/testexplain"]

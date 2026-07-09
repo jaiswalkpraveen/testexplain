@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from testlens.models import FailureContext
-from testlens.ingestion.playwright import parse_report
+from testexplain.models import FailureContext
+from testexplain.ingestion.playwright import parse_report
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
 
