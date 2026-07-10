@@ -80,18 +80,24 @@ class OpenAICompatibleGateway:
     not mid-request.
     """
 
-    def __init__(self, model: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
         import os
 
         from openai import OpenAI
 
         self.model = model or os.environ["LLM_MODEL"]
+        resolved_url = base_url or os.environ["LLM_BASE_URL"]
+        resolved_key = api_key or os.environ.get("LLM_API_KEY", "")
         self.client = OpenAI(
-            base_url=os.environ["LLM_BASE_URL"],
-            # "or" kicks in when the env var is set but empty (no-auth
-            # LAN endpoint): the client demands *some* string, the server
-            # never checks it.
-            api_key=os.environ["LLM_API_KEY"] or "unused",
+            base_url=resolved_url,
+            # "or" kicks in when the key is empty (no-auth LAN endpoint):
+            # the client demands *some* string, the server never checks it.
+            api_key=resolved_key or "unused",
         )
 
     def generate(self, prompt: str) -> str:

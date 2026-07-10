@@ -70,3 +70,15 @@ def test_openai_compatible_gateway_fails_fast_when_url_missing(monkeypatch):
 
     with pytest.raises(KeyError):
         OpenAICompatibleGateway()
+
+
+def test_openai_compatible_gateway_accepts_explicit_params():
+    gw = OpenAICompatibleGateway(
+        model="gpt-4",
+        api_key="sk-explicit",
+        base_url="https://custom.example.com/v1",
+    )
+
+    assert gw.model == "gpt-4"
+    assert gw.client.api_key == "sk-explicit"
+    assert str(gw.client.base_url) == "https://custom.example.com/v1/"
