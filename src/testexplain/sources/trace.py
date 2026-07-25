@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import math
 import zipfile
@@ -12,9 +10,18 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
-from testexplain.models import Evidence, EvidenceProvenance
+from testexplain.models import Evidence
+from testexplain.sources.common import (
+    SourceResult,
+    finite_float,
+    forgiving_b64decode,
+    reject_constant,
+)
+from testexplain.sources.network import (
+    MAX_NETWORK_URL_LENGTH,
+    har_entry_evidence,
+)
 
 SUPPORTED_TRACE_VERSIONS = {8}
 TRACE_SUFFIX = ".trace"
@@ -22,21 +29,6 @@ NETWORK_SUFFIX = ".network"
 CONSOLE_SEVERITY = {"error": 4, "warning": 3, "warn": 3, "info": 2}
 DEFAULT_CONSOLE_SEVERITY = 1
 STDIO_SEVERITY = {"stderr": 3, "stdout": 1}
-NETWORK_SEVERITY_BY_STATUS_CLASS = {5: 4, 4: 3, 3: 2}
-NETWORK_FAILURE_SEVERITY = 4
-NETWORK_ABORTED_SEVERITY = 3
-NETWORK_UNKNOWN_SEVERITY = 2
-DEFAULT_NETWORK_SEVERITY = 1
-UNKNOWN_MIME_TYPE = "x-unknown"
-UNKNOWN_FIELD = "unknown"
-REDACTED_FIELD = "<redacted>"
-MIN_HTTP_STATUS = 100
-MAX_NETWORK_URL_LENGTH = 300
-NETWORK_FLAGS = (
-    ("_wasAborted", "aborted"),
-    ("_wasFulfilled", "fulfilled"),
-    ("_wasContinued", "continued"),
-)
 MAX_TRACE_MEMBERS = 100
 MAX_TRACE_MEMBER_SIZE = 100 * 1024 * 1024
 MAX_TRACE_TOTAL_SIZE = 500 * 1024 * 1024
@@ -45,11 +37,13 @@ MAX_TRACE_EVENTS = 100_000
 MAX_TRACE_EVIDENCE = 50_000
 MAX_TRACE_WARNINGS = 1_000
 
+# Re-exported so callers and tests that reach for the network URL cap through this
+# adapter keep working after the shared normalizer moved to ``sources.network``.
+__all__ = ["MAX_NETWORK_URL_LENGTH", "TraceResult", "read_trace_actions"]
 
-@dataclass
-class TraceResult:
-    evidence: list[Evidence] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+# The trace adapter used to own this result shape. Every adapter returns it now,
+# so the name here is an alias kept for readability at the call sites.
+TraceResult = SourceResult
 
 
 @dataclass
@@ -229,7 +223,7 @@ def _read_stream(
             continue
 
         try:
-            event = json.loads(raw_line, parse_constant=_reject_constant)
+            event = json.loads(raw_line, parse_constant=reject_constant)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
             warn(f"{member_name} line {line_number}: malformed JSON; skipped")
             continue
@@ -335,22 +329,8 @@ def _read_stream(
     return context
 
 
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON number: {value}")
-
-
 def _has_usable_anchor(context: dict[str, Any]) -> bool:
-    return all(_finite_float(context.get(key)) is not None for key in ("wallTime", "monotonicTime"))
-
-
-def _finite_float(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        converted = float(value)
-    except OverflowError:
-        return None
-    return converted if math.isfinite(converted) else None
+    return all(finite_float(context.get(key)) is not None for key in ("wallTime", "monotonicTime"))
 
 
 def _to_evidence(
@@ -451,172 +431,11 @@ def _network_evidence(snapshot: dict[str, Any], context: dict[str, Any] | None) 
     traces: the ``trace`` provenance and a wall-clock time derived from the
     monotonic stamp against the paired stream's clock anchor.
     """
-    return _har_entry_evidence(
+    return har_entry_evidence(
         snapshot,
         provenance="trace",
         timestamp_ms=_wall_timestamp(snapshot.get("_monotonicTime"), context),
     )
-
-
-def _har_entry_evidence(
-    entry: dict[str, Any],
-    *,
-    provenance: EvidenceProvenance,
-    timestamp_ms: float | None,
-) -> Evidence:
-    """Summarize one HAR entry, rendering every Playwright sentinel as ``unknown``.
-
-    Playwright pre-fills entries with ``status: -1``, ``time: -1``, and
-    ``mimeType: "x-unknown"`` and overwrites them only when the real values
-    arrive, so those sentinels must never be reported as if they were measurements.
-    Response bodies are deliberately ignored: a trace stores them as ``_sha1``
-    pointers into ``resources/`` rather than inline text.
-    """
-    request = entry.get("request")
-    request = request if isinstance(request, dict) else {}
-    response = entry.get("response")
-    response = response if isinstance(response, dict) else {}
-
-    method = request.get("method")
-    method = method if isinstance(method, str) and method else UNKNOWN_FIELD.upper()
-    status = _http_status(response.get("status"))
-    failure_text = response.get("_failureText")
-    failure_text = failure_text if isinstance(failure_text, str) and failure_text else None
-
-    parts = [
-        f"{method} {_sanitize_url(request.get('url'))}",
-        f"status={_format_status(status, response.get('statusText'))}",
-        f"mime={_format_mime_type(response)}",
-        f"time={_format_duration(entry.get('time'))}",
-    ]
-    if failure_text:
-        parts.append(f"failure={failure_text}")
-    parts.extend(label for key, label in NETWORK_FLAGS if entry.get(key) is True)
-
-    return Evidence(
-        source="network",
-        provenance=provenance,
-        summary=" | ".join(parts),
-        severity=_network_severity(status, failure_text, entry),
-        timestamp_ms=timestamp_ms,
-    )
-
-
-def _http_status(value: Any) -> int | None:
-    """Return a real HTTP status code, rejecting the ``-1`` "not yet known" sentinel."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value if value >= MIN_HTTP_STATUS else None
-
-
-def _format_status(status: int | None, status_text: Any) -> str:
-    if status is None:
-        return UNKNOWN_FIELD
-    if isinstance(status_text, str) and status_text:
-        return f"{status} {status_text}"
-    return str(status)
-
-
-def _format_mime_type(response: dict[str, Any]) -> str:
-    """Report the response content type, treating ``x-unknown`` as never learned."""
-    content = response.get("content")
-    mime_type = content.get("mimeType") if isinstance(content, dict) else None
-    if not isinstance(mime_type, str) or not mime_type or mime_type == UNKNOWN_MIME_TYPE:
-        return UNKNOWN_FIELD
-    return mime_type
-
-
-def _format_duration(value: Any) -> str:
-    """Render a HAR duration in milliseconds, treating negatives as unknown."""
-    duration = _finite_float(value)
-    if duration is None or duration < 0:
-        return UNKNOWN_FIELD
-    return f"{duration:.1f}ms"
-
-
-def _network_severity(status: int | None, failure_text: str | None, entry: dict[str, Any]) -> int:
-    """Rank a request so later budgeting keeps the most diagnostic traffic.
-
-    Server errors and transport failures outrank client errors, which outrank
-    redirects and requests whose outcome never became known; successful traffic
-    ranks lowest because it rarely explains a failure.
-    """
-    if status is None:
-        if failure_text:
-            return NETWORK_FAILURE_SEVERITY
-        if entry.get("_wasAborted") is True:
-            return NETWORK_ABORTED_SEVERITY
-        return NETWORK_UNKNOWN_SEVERITY
-    return NETWORK_SEVERITY_BY_STATUS_CLASS.get(status // 100, DEFAULT_NETWORK_SEVERITY)
-
-
-def _sanitize_url(value: Any) -> str:
-    """Strip secrets from a URL while preserving its diagnostic shape.
-
-    Credentials become ``***``, the fragment is dropped because it never reaches
-    the server, and query values are replaced while their names survive: the name
-    is usually the useful signal and the value is where tokens hide.
-    """
-    if not isinstance(value, str) or not value:
-        return UNKNOWN_FIELD
-    try:
-        split = urlsplit(value)
-        if split.scheme and not split.netloc and not value.startswith(f"{split.scheme}://"):
-            # An opaque URL such as data:, blob:, or javascript: keeps its whole
-            # payload in the path, so only the scheme is safe to report.
-            return f"{split.scheme}:{REDACTED_FIELD}"
-        query = "&".join(
-            pair if "=" not in pair else f"{pair.split('=', 1)[0]}={REDACTED_FIELD}"
-            for pair in split.query.split("&")
-            if pair
-        )
-        path = split.path if split.netloc else _redact_authority_credentials(split.path)
-        sanitized = urlunsplit(
-            (split.scheme, _redact_userinfo(split.netloc), path, query, "")
-        )
-    except ValueError:
-        # The URL is unparsable, so drop everything that can carry a secret and
-        # redact credentials by hand rather than trusting the raw text.
-        sanitized = _redact_unparsable_userinfo(value.split("#", 1)[0].split("?", 1)[0])
-    if not sanitized:
-        # Everything the URL contained was unsafe, so report nothing rather than
-        # an empty field that would read as a real request to a bare host.
-        return UNKNOWN_FIELD
-    if len(sanitized) > MAX_NETWORK_URL_LENGTH:
-        return sanitized[:MAX_NETWORK_URL_LENGTH] + "\u2026"
-    return sanitized
-
-
-def _redact_userinfo(netloc: str) -> str:
-    """Replace any ``user:password`` prefix with ``***``, keeping the host visible."""
-    if "@" not in netloc:
-        return netloc
-    return f"***@{netloc.rsplit('@', 1)[1]}"
-
-
-def _redact_unparsable_userinfo(url: str) -> str:
-    """Redact credentials in a URL that ``urlsplit`` refused to parse."""
-    scheme, separator, remainder = url.partition("://")
-    if not separator:
-        return _redact_authority_credentials(url)
-    host, slash, path = remainder.partition("/")
-    return f"{scheme}://{_redact_userinfo(host)}{slash}{path}"
-
-
-def _redact_authority_credentials(value: str) -> str:
-    """Redact ``user:password@`` in text that has no recognizable URL authority.
-
-    Only a ``user:password`` pair is redacted. A bare ``@`` is left alone because
-    it is ordinary path content, as in an ``/@scope/package`` request.
-    """
-    if "@" not in value:
-        return value
-    prefix, _, remainder = value.rpartition("@")
-    boundary = max(prefix.rfind(character) for character in ("/", "\\"))
-    credentials = prefix[boundary + 1 :]
-    if ":" not in credentials:
-        return value
-    return f"{prefix[: boundary + 1]}***@{remainder}"
 
 
 def _stdio_text(event: dict[str, Any]) -> str | None:
@@ -627,24 +446,10 @@ def _stdio_text(event: dict[str, Any]) -> str | None:
     encoded = event.get("base64")
     if not isinstance(encoded, str):
         return None
-    decoded = _forgiving_b64decode(encoded)
+    decoded = forgiving_b64decode(encoded)
     if decoded is None:
         return None
     return decoded.decode("utf-8", errors="replace")
-
-
-def _forgiving_b64decode(encoded: str) -> bytes | None:
-    """Decode base64 the way ``atob`` does: ignore whitespace, tolerate lost padding."""
-    stripped = "".join(encoded.split())
-    remainder = len(stripped) % 4
-    if remainder == 1:
-        return None
-    if remainder:
-        stripped += "=" * (4 - remainder)
-    try:
-        return base64.b64decode(stripped, validate=True)
-    except (binascii.Error, ValueError):
-        return None
 
 
 def _unwrap_serialized_error(error: Any) -> Any:
@@ -692,9 +497,9 @@ def _format_error(error: Any) -> str:
 def _wall_timestamp(start_time: Any, context: dict[str, Any] | None) -> float | None:
     if context is None:
         return None
-    start = _finite_float(start_time)
-    wall = _finite_float(context.get("wallTime"))
-    monotonic = _finite_float(context.get("monotonicTime"))
+    start = finite_float(start_time)
+    wall = finite_float(context.get("wallTime"))
+    monotonic = finite_float(context.get("monotonicTime"))
     if start is None or wall is None or monotonic is None:
         return None
     timestamp = wall + (start - monotonic)
