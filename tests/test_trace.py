@@ -1,8 +1,14 @@
+import base64
 import json
 import zipfile
 from pathlib import Path
 
 from testexplain.sources.trace import read_trace_actions
+
+
+def _b64(text: str) -> str:
+    """Encode text the way the Playwright runner encodes a Node Buffer chunk."""
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
 def _json_lines(*events: object) -> str:
@@ -523,3 +529,303 @@ def test_read_trace_actions_returns_none_when_timestamp_arithmetic_overflows(tmp
     ]
     assert [evidence.timestamp_ms for evidence in result.evidence] == [None, None, 301.0]
     assert any("integer.trace" in warning and "missing usable clock anchor" in warning for warning in result.warnings)
+
+
+def test_read_trace_actions_normalizes_console_severity_and_location(tmp_path):
+    trace = tmp_path / "trace.zip"
+    events = [
+        {"version": 8, "type": "context-options", "wallTime": 1_000, "monotonicTime": 10},
+        {
+            "type": "console",
+            "time": 11,
+            "messageType": "error",
+            "text": "POST /api/profile returned 500",
+            "location": {
+                "url": "https://app.test/profile.js",
+                "lineNumber": 87,
+                "columnNumber": 14,
+            },
+            "pageId": "page@1",
+        },
+        {
+            "type": "console",
+            "time": 12,
+            "messageType": "warning",
+            "text": "slow response",
+            "location": {"url": "", "lineNumber": 0, "columnNumber": 0},
+        },
+        {"type": "console", "time": 13, "messageType": "warn", "text": "deprecated call"},
+        {"type": "console", "time": 14, "messageType": "ERROR", "text": "upper case type"},
+        {"type": "console", "time": 15, "messageType": "info", "text": "profile loaded"},
+        {"type": "console", "time": 16, "messageType": "log", "text": "render complete"},
+        {"type": "console", "time": 17, "messageType": "debug", "text": "cache hit"},
+        {"type": "console", "time": 18, "messageType": "count", "text": "unknown type"},
+        {"type": "console", "time": 19, "text": "type is missing"},
+    ]
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.trace", _json_lines(*events))
+
+    result = read_trace_actions(trace)
+
+    assert [evidence.source for evidence in result.evidence] == ["console"] * 9
+    assert {evidence.provenance for evidence in result.evidence} == {"trace"}
+    assert [evidence.summary for evidence in result.evidence] == [
+        "error: POST /api/profile returned 500 | location=https://app.test/profile.js:87:14",
+        "warning: slow response",
+        "warn: deprecated call",
+        "ERROR: upper case type",
+        "info: profile loaded",
+        "log: render complete",
+        "debug: cache hit",
+        "count: unknown type",
+        "console: type is missing",
+    ]
+    assert [evidence.severity for evidence in result.evidence] == [4, 3, 3, 4, 2, 1, 1, 1, 1]
+    assert [evidence.timestamp_ms for evidence in result.evidence] == [
+        1_001.0,
+        1_002.0,
+        1_003.0,
+        1_004.0,
+        1_005.0,
+        1_006.0,
+        1_007.0,
+        1_008.0,
+        1_009.0,
+    ]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_normalizes_page_errors_from_serialized_events(tmp_path):
+    trace = tmp_path / "trace.zip"
+    events = [
+        {"version": 8, "type": "context-options", "wallTime": 2_000, "monotonicTime": 20},
+        {
+            "type": "event",
+            "time": 21,
+            "class": "BrowserContext",
+            "method": "pageError",
+            "params": {
+                "error": {
+                    "error": {
+                        "name": "TypeError",
+                        "message": "Cannot read properties of undefined (reading 'id')",
+                        "stack": "at profile.js:87",
+                    }
+                }
+            },
+            "pageId": "page@1",
+        },
+        {
+            "type": "event",
+            "time": 22,
+            "class": "BrowserContext",
+            "method": "pageError",
+            "params": {
+                "error": {"error": {"name": "Error", "message": "with location"}},
+                "location": {"url": "https://app.test/profile.js", "line": 87, "column": 14},
+            },
+        },
+        {
+            "type": "event",
+            "time": 23,
+            "class": "BrowserContext",
+            "method": "pageError",
+            "params": {"error": {"value": {"s": "thrown string"}}},
+        },
+        {
+            "type": "event",
+            "time": 24,
+            "class": "BrowserContext",
+            "method": "pageError",
+            "params": {"error": {"name": "FlatError", "message": "already unwrapped"}},
+        },
+        {
+            "type": "event",
+            "time": 25,
+            "class": "BrowserContext",
+            "method": "dialog",
+            "params": {"type": "alert", "message": "ignored by task 5"},
+        },
+    ]
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.trace", _json_lines(*events))
+
+    result = read_trace_actions(trace)
+
+    assert [evidence.source for evidence in result.evidence] == ["page_error"] * 4
+    assert [evidence.summary for evidence in result.evidence] == [
+        "TypeError: Cannot read properties of undefined (reading 'id')",
+        "Error: with location | location=https://app.test/profile.js:87:14",
+        '{"s":"thrown string"}',
+        "FlatError: already unwrapped",
+    ]
+    assert [evidence.severity for evidence in result.evidence] == [4, 4, 4, 4]
+    assert [evidence.timestamp_ms for evidence in result.evidence] == [
+        2_001.0,
+        2_002.0,
+        2_003.0,
+        2_004.0,
+    ]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_normalizes_runner_stdout_and_stderr(tmp_path):
+    trace = tmp_path / "trace.zip"
+    events = [
+        {"version": 8, "type": "context-options", "wallTime": 3_000, "monotonicTime": 30},
+        {"type": "stdout", "timestamp": 31, "text": "profile payload prepared\n"},
+        {"type": "stderr", "timestamp": 32, "text": "save request failed after retry\n"},
+        {"type": "stdout", "text": "output without a clock"},
+    ]
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("test.trace", _json_lines(*events))
+
+    result = read_trace_actions(trace)
+
+    assert [evidence.source for evidence in result.evidence] == ["stdout", "stderr", "stdout"]
+    assert [evidence.summary for evidence in result.evidence] == [
+        "profile payload prepared\n",
+        "save request failed after retry\n",
+        "output without a clock",
+    ]
+    assert [evidence.severity for evidence in result.evidence] == [1, 3, 1]
+    assert [evidence.timestamp_ms for evidence in result.evidence] == [3_001.0, 3_002.0, None]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_decodes_base64_output_and_isolates_bad_payloads(tmp_path):
+    trace = tmp_path / "trace.zip"
+    events = [
+        {"version": 8, "type": "context-options", "wallTime": 4_000, "monotonicTime": 40},
+        {"type": "stderr", "timestamp": 41, "base64": _b64("save request failed after retry\n")},
+        {
+            "type": "stdout",
+            "timestamp": 42,
+            "text": "plain text wins",
+            "base64": _b64("ignored"),
+        },
+        {
+            "type": "stdout",
+            "timestamp": 43,
+            "base64": base64.b64encode(b"\xff\xfebytes").decode("ascii"),
+        },
+        {"type": "stdout", "timestamp": 44, "base64": "aGVs\nbG8g"},
+        {"type": "stdout", "timestamp": 45, "base64": _b64("no padding").rstrip("=")},
+        {"type": "stdout", "timestamp": 46, "base64": ""},
+        {"type": "stderr", "timestamp": 47, "base64": "not*valid*base64"},
+        {"type": "stderr", "timestamp": 48, "base64": "abcde"},
+        {"type": "stdout", "timestamp": 49},
+        {"type": "stderr", "timestamp": 50, "base64": 12},
+        {"type": "stdout", "timestamp": 51, "text": "still parsing after bad payloads"},
+    ]
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("test.trace", _json_lines(*events))
+
+    result = read_trace_actions(trace)
+
+    assert [evidence.summary for evidence in result.evidence] == [
+        "save request failed after retry\n",
+        "plain text wins",
+        "\ufffd\ufffdbytes",
+        "hello ",
+        "no padding",
+        "",
+        "still parsing after bad payloads",
+    ]
+    assert [evidence.severity for evidence in result.evidence] == [3, 1, 1, 1, 1, 1, 1]
+    assert [evidence.timestamp_ms for evidence in result.evidence] == [
+        4_001.0,
+        4_002.0,
+        4_003.0,
+        4_004.0,
+        4_005.0,
+        4_006.0,
+        4_011.0,
+    ]
+    assert sum("unusable stderr payload" in warning for warning in result.warnings) == 3
+    assert sum("unusable stdout payload" in warning for warning in result.warnings) == 1
+    assert any("test.trace line 8" in warning and "unusable stderr" in warning for warning in result.warnings)
+    assert any("test.trace line 9" in warning and "unusable stderr" in warning for warning in result.warnings)
+    assert any("test.trace line 10" in warning and "unusable stdout" in warning for warning in result.warnings)
+    assert any("test.trace line 11" in warning and "unusable stderr" in warning for warning in result.warnings)
+
+
+def test_read_trace_actions_interleaves_output_without_breaking_action_pairing(tmp_path):
+    trace = tmp_path / "trace.zip"
+    events = [
+        {"version": 8, "type": "context-options", "wallTime": 5_000, "monotonicTime": 50},
+        {"type": "stdout", "timestamp": 51, "text": "starting"},
+        {"type": "before", "callId": "call@1", "startTime": 52, "title": "click Save"},
+        {"type": "console", "time": 53, "messageType": "error", "text": "returned 500"},
+        {"type": "log", "callId": "call@1", "time": 54, "message": "locator resolved"},
+        {
+            "type": "event",
+            "time": 55,
+            "class": "BrowserContext",
+            "method": "pageError",
+            "params": {"error": {"error": {"name": "TypeError", "message": "undefined id"}}},
+        },
+        {"type": "after", "callId": "call@1", "endTime": 56, "result": {"status": "ok"}},
+        {"type": "stderr", "timestamp": 57, "text": "save failed"},
+        {"type": "before", "callId": "call@2", "startTime": 58, "title": "expect confirmation"},
+        {"type": "console", "time": 59, "messageType": "info", "text": "still waiting"},
+    ]
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.trace", _json_lines(*events))
+
+    result = read_trace_actions(trace)
+
+    assert [(evidence.source, evidence.summary) for evidence in result.evidence] == [
+        ("stdout", "starting"),
+        ("console", "error: returned 500"),
+        ("page_error", "TypeError: undefined id"),
+        ("action", 'click Save | logs=locator resolved | result={"status":"ok"}'),
+        ("stderr", "save failed"),
+        ("console", "info: still waiting"),
+        ("action", "expect confirmation | incomplete"),
+    ]
+    assert [evidence.timestamp_ms for evidence in result.evidence] == [
+        5_001.0,
+        5_003.0,
+        5_005.0,
+        5_002.0,
+        5_007.0,
+        5_009.0,
+        5_008.0,
+    ]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_applies_task_4_safety_rules_to_console_and_output(tmp_path, monkeypatch):
+    import testexplain.sources.trace as trace_module
+
+    trace = tmp_path / "trace.zip"
+    early = [
+        {"type": "console", "time": 1, "messageType": "error", "text": "before schema"},
+        {"version": 8, "type": "context-options", "wallTime": 100, "monotonicTime": 10},
+    ]
+    unsupported = [
+        {"version": 999, "type": "context-options", "wallTime": 200, "monotonicTime": 20},
+        {"type": "stderr", "timestamp": 21, "text": "unsupported stream"},
+    ]
+    healthy = [
+        {"version": 8, "type": "context-options", "wallTime": 300, "monotonicTime": 30},
+        {"type": "console", "time": 31, "messageType": "error", "text": "kept"},
+        {"type": "stdout", "timestamp": 32, "text": "kept too"},
+    ]
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("early.trace", _json_lines(*early))
+        archive.writestr("unsupported.trace", _json_lines(*unsupported))
+        archive.writestr("healthy.trace", _json_lines(*healthy))
+
+    result = read_trace_actions(trace)
+
+    assert [evidence.summary for evidence in result.evidence] == ["error: kept", "kept too"]
+    assert any("early.trace" in warning and "before context-options" in warning for warning in result.warnings)
+    assert any("unsupported.trace" in warning and "unsupported trace version 999" in warning for warning in result.warnings)
+
+    monkeypatch.setattr(trace_module, "MAX_TRACE_EVIDENCE", 1)
+    capped = read_trace_actions(trace)
+
+    assert [evidence.summary for evidence in capped.evidence] == ["error: kept"]
+    assert any("evidence limit exceeded" in warning for warning in capped.warnings)
