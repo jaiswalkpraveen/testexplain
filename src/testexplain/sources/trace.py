@@ -1,4 +1,4 @@
-"""Read Playwright trace action, console, and output events into normalized evidence."""
+"""Read Playwright trace action, console, output, and network events into evidence."""
 
 from __future__ import annotations
 
@@ -12,13 +12,31 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
-from testexplain.models import Evidence
+from testexplain.models import Evidence, EvidenceProvenance
 
 SUPPORTED_TRACE_VERSIONS = {8}
+TRACE_SUFFIX = ".trace"
+NETWORK_SUFFIX = ".network"
 CONSOLE_SEVERITY = {"error": 4, "warning": 3, "warn": 3, "info": 2}
 DEFAULT_CONSOLE_SEVERITY = 1
 STDIO_SEVERITY = {"stderr": 3, "stdout": 1}
+NETWORK_SEVERITY_BY_STATUS_CLASS = {5: 4, 4: 3, 3: 2}
+NETWORK_FAILURE_SEVERITY = 4
+NETWORK_ABORTED_SEVERITY = 3
+NETWORK_UNKNOWN_SEVERITY = 2
+DEFAULT_NETWORK_SEVERITY = 1
+UNKNOWN_MIME_TYPE = "x-unknown"
+UNKNOWN_FIELD = "unknown"
+REDACTED_FIELD = "<redacted>"
+MIN_HTTP_STATUS = 100
+MAX_NETWORK_URL_LENGTH = 300
+NETWORK_FLAGS = (
+    ("_wasAborted", "aborted"),
+    ("_wasFulfilled", "fulfilled"),
+    ("_wasContinued", "continued"),
+)
 MAX_TRACE_MEMBERS = 100
 MAX_TRACE_MEMBER_SIZE = 100 * 1024 * 1024
 MAX_TRACE_TOTAL_SIZE = 500 * 1024 * 1024
@@ -41,49 +59,119 @@ class _PendingAction:
 
 
 def read_trace_actions(path: Path) -> TraceResult:
-    """Return normalized action, console, and output evidence per ``*.trace`` member."""
+    """Return normalized action, console, output, and network evidence per trace stream.
+
+    Playwright splits one browser context across sibling members that share an
+    ordinal: ``<ordinal>.trace`` holds actions, console, and output records while
+    ``<ordinal>.network`` holds the resource snapshots. Only the ``.trace`` member
+    carries the ``context-options`` header, so each network stream is read with the
+    schema version and clock anchor inherited from its paired trace stream.
+    """
     result = TraceResult()
     try:
         with zipfile.ZipFile(path) as archive:
-            trace_members = [
-                member
-                for member in archive.infolist()
-                if not member.is_dir() and member.filename.endswith(".trace")
-            ]
-            if len(trace_members) > MAX_TRACE_MEMBERS:
-                result.warnings.append(
-                    f"{path.name}: trace member limit exceeded; only first "
-                    f"{MAX_TRACE_MEMBERS} members processed"
-                )
-                trace_members = trace_members[:MAX_TRACE_MEMBERS]
+            members = [member for member in archive.infolist() if not member.is_dir()]
+            trace_members = _limit_members(
+                [member for member in members if member.filename.endswith(TRACE_SUFFIX)],
+                f"{path.name}: trace member limit exceeded",
+                result,
+            )
+            network_members = _limit_members(
+                [member for member in members if member.filename.endswith(NETWORK_SUFFIX)],
+                f"{path.name}: network member limit exceeded",
+                result,
+            )
+            network_by_stem = {
+                member.filename[: -len(NETWORK_SUFFIX)]: member for member in network_members
+            }
 
             total_size = 0
-            for member in trace_members:
+
+            def within_size_limits(member: zipfile.ZipInfo) -> bool:
+                """Charge one member against the per-member and whole-archive budgets."""
+                nonlocal total_size
                 if member.file_size > MAX_TRACE_MEMBER_SIZE:
                     result.warnings.append(
                         f"{member.filename}: trace member size limit exceeded; skipped"
                     )
-                    continue
+                    return False
                 if total_size + member.file_size > MAX_TRACE_TOTAL_SIZE:
                     result.warnings.append(
                         f"{member.filename}: trace total size limit exceeded; skipped"
                     )
-                    continue
+                    return False
                 total_size += member.file_size
+                return True
+
+            def read_member(
+                member: zipfile.ZipInfo,
+                inherited_context: dict[str, Any] | None = None,
+            ) -> dict[str, Any] | None:
+                """Read one member, returning its context when the stream was usable."""
                 try:
                     with archive.open(member) as stream:
-                        _read_stream(member.filename, stream, result)
+                        return _read_stream(
+                            member.filename,
+                            stream,
+                            result,
+                            inherited_context=inherited_context,
+                        )
                 except (zipfile.BadZipFile, OSError, RuntimeError, EOFError, zlib.error) as exc:
                     result.warnings.append(
                         f"{member.filename}: unreadable trace member; skipped ({exc})"
+                    )
+                    return None
+
+            paired_stems = set()
+            for member in trace_members:
+                stem = member.filename[: -len(TRACE_SUFFIX)]
+                paired_stems.add(stem)
+                if not within_size_limits(member):
+                    continue
+                context = read_member(member)
+                network_member = network_by_stem.get(stem)
+                if context is None or network_member is None:
+                    continue
+                if not within_size_limits(network_member):
+                    continue
+                read_member(network_member, inherited_context=context)
+
+            for stem, member in network_by_stem.items():
+                if stem not in paired_stems:
+                    result.warnings.append(
+                        f"{member.filename}: network member has no paired trace stream; skipped"
                     )
     except (zipfile.BadZipFile, OSError, RuntimeError):
         result.warnings.append(f"{path.name}: unreadable ZIP; skipped")
     return result
 
 
-def _read_stream(member_name: str, stream: Any, result: TraceResult) -> None:
-    context: dict[str, Any] | None = None
+def _limit_members(
+    members: list[zipfile.ZipInfo],
+    message: str,
+    result: TraceResult,
+) -> list[zipfile.ZipInfo]:
+    """Cap one member family so a crafted archive cannot flood work or warnings."""
+    if len(members) <= MAX_TRACE_MEMBERS:
+        return members
+    result.warnings.append(f"{message}; only first {MAX_TRACE_MEMBERS} members processed")
+    return members[:MAX_TRACE_MEMBERS]
+
+
+def _read_stream(
+    member_name: str,
+    stream: Any,
+    result: TraceResult,
+    *,
+    inherited_context: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Read one stream, returning its context when the stream produced usable evidence.
+
+    A network stream has no ``context-options`` header of its own, so it is handed the
+    context of its paired trace stream. Returning ``None`` marks a stream the caller
+    must not pair anything with: its schema version, clocks, or framing were unusable.
+    """
+    context: dict[str, Any] | None = inherited_context
     pending: dict[str, _PendingAction] = {}
     member_evidence: list[Evidence] = []
     member_warnings: list[str] = []
@@ -132,7 +220,7 @@ def _read_stream(member_name: str, stream: Any, result: TraceResult) -> None:
         if line_number > MAX_TRACE_EVENTS:
             warn(f"{member_name}: event limit exceeded; stream skipped", terminal=True)
             flush_warnings()
-            return
+            return None
 
         if len(raw_line) > MAX_TRACE_LINE_LENGTH:
             while raw_line and not raw_line.endswith(b"\n"):
@@ -154,11 +242,11 @@ def _read_stream(member_name: str, stream: Any, result: TraceResult) -> None:
             if context is not None:
                 warn(f"{member_name}: duplicate context-options; stream skipped", terminal=True)
                 flush_warnings()
-                return
+                return None
             if saw_event_before_context:
                 warn(f"{member_name}: late context-options; stream skipped", terminal=True)
                 flush_warnings()
-                return
+                return None
             version = event.get("version")
             if type(version) is not int or version not in SUPPORTED_TRACE_VERSIONS:
                 warn(
@@ -166,7 +254,7 @@ def _read_stream(member_name: str, stream: Any, result: TraceResult) -> None:
                     terminal=True,
                 )
                 flush_warnings()
-                return
+                return None
             context = event
             if not _has_usable_anchor(context):
                 warn(f"{member_name}: missing usable clock anchor")
@@ -183,6 +271,21 @@ def _read_stream(member_name: str, stream: Any, result: TraceResult) -> None:
         if event_type == "event":
             if event.get("method") == "pageError":
                 stage(lambda event=event: _page_error_evidence(event, context), "page error")
+            continue
+        if event_type == "resource-snapshot":
+            snapshot = event.get("snapshot")
+            # The request is required because it supplies the method and URL that make
+            # the record meaningful. A missing or broken response is tolerated: a
+            # request that never completed is itself a useful triage signal, and every
+            # response-derived field degrades to "unknown".
+            request = snapshot.get("request") if isinstance(snapshot, dict) else None
+            if not isinstance(snapshot, dict) or not isinstance(request, dict):
+                warn(
+                    f"{member_name} line {line_number}: "
+                    "unusable resource-snapshot payload; skipped"
+                )
+                continue
+            stage(lambda snapshot=snapshot: _network_evidence(snapshot, context), "network")
             continue
         if event_type in STDIO_SEVERITY:
             text = _stdio_text(event)
@@ -220,7 +323,7 @@ def _read_stream(member_name: str, stream: Any, result: TraceResult) -> None:
     if context is None:
         warn(f"{member_name}: missing context-options; stream skipped", terminal=True)
         flush_warnings()
-        return
+        return None
 
     for action in pending.values():
         emit(action, None)
@@ -229,6 +332,7 @@ def _read_stream(member_name: str, stream: Any, result: TraceResult) -> None:
 
     result.evidence.extend(member_evidence)
     flush_warnings()
+    return context
 
 
 def _reject_constant(value: str) -> None:
@@ -337,6 +441,182 @@ def _stdio_evidence(
         severity=STDIO_SEVERITY[stream],
         timestamp_ms=_wall_timestamp(event.get("timestamp"), context),
     )
+
+
+def _network_evidence(snapshot: dict[str, Any], context: dict[str, Any] | None) -> Evidence:
+    """Normalize one trace ``resource-snapshot`` into network evidence.
+
+    A trace resource snapshot is literally a HAR entry, so the shared HAR
+    normalizer does the work and this wrapper only supplies what is specific to
+    traces: the ``trace`` provenance and a wall-clock time derived from the
+    monotonic stamp against the paired stream's clock anchor.
+    """
+    return _har_entry_evidence(
+        snapshot,
+        provenance="trace",
+        timestamp_ms=_wall_timestamp(snapshot.get("_monotonicTime"), context),
+    )
+
+
+def _har_entry_evidence(
+    entry: dict[str, Any],
+    *,
+    provenance: EvidenceProvenance,
+    timestamp_ms: float | None,
+) -> Evidence:
+    """Summarize one HAR entry, rendering every Playwright sentinel as ``unknown``.
+
+    Playwright pre-fills entries with ``status: -1``, ``time: -1``, and
+    ``mimeType: "x-unknown"`` and overwrites them only when the real values
+    arrive, so those sentinels must never be reported as if they were measurements.
+    Response bodies are deliberately ignored: a trace stores them as ``_sha1``
+    pointers into ``resources/`` rather than inline text.
+    """
+    request = entry.get("request")
+    request = request if isinstance(request, dict) else {}
+    response = entry.get("response")
+    response = response if isinstance(response, dict) else {}
+
+    method = request.get("method")
+    method = method if isinstance(method, str) and method else UNKNOWN_FIELD.upper()
+    status = _http_status(response.get("status"))
+    failure_text = response.get("_failureText")
+    failure_text = failure_text if isinstance(failure_text, str) and failure_text else None
+
+    parts = [
+        f"{method} {_sanitize_url(request.get('url'))}",
+        f"status={_format_status(status, response.get('statusText'))}",
+        f"mime={_format_mime_type(response)}",
+        f"time={_format_duration(entry.get('time'))}",
+    ]
+    if failure_text:
+        parts.append(f"failure={failure_text}")
+    parts.extend(label for key, label in NETWORK_FLAGS if entry.get(key) is True)
+
+    return Evidence(
+        source="network",
+        provenance=provenance,
+        summary=" | ".join(parts),
+        severity=_network_severity(status, failure_text, entry),
+        timestamp_ms=timestamp_ms,
+    )
+
+
+def _http_status(value: Any) -> int | None:
+    """Return a real HTTP status code, rejecting the ``-1`` "not yet known" sentinel."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= MIN_HTTP_STATUS else None
+
+
+def _format_status(status: int | None, status_text: Any) -> str:
+    if status is None:
+        return UNKNOWN_FIELD
+    if isinstance(status_text, str) and status_text:
+        return f"{status} {status_text}"
+    return str(status)
+
+
+def _format_mime_type(response: dict[str, Any]) -> str:
+    """Report the response content type, treating ``x-unknown`` as never learned."""
+    content = response.get("content")
+    mime_type = content.get("mimeType") if isinstance(content, dict) else None
+    if not isinstance(mime_type, str) or not mime_type or mime_type == UNKNOWN_MIME_TYPE:
+        return UNKNOWN_FIELD
+    return mime_type
+
+
+def _format_duration(value: Any) -> str:
+    """Render a HAR duration in milliseconds, treating negatives as unknown."""
+    duration = _finite_float(value)
+    if duration is None or duration < 0:
+        return UNKNOWN_FIELD
+    return f"{duration:.1f}ms"
+
+
+def _network_severity(status: int | None, failure_text: str | None, entry: dict[str, Any]) -> int:
+    """Rank a request so later budgeting keeps the most diagnostic traffic.
+
+    Server errors and transport failures outrank client errors, which outrank
+    redirects and requests whose outcome never became known; successful traffic
+    ranks lowest because it rarely explains a failure.
+    """
+    if status is None:
+        if failure_text:
+            return NETWORK_FAILURE_SEVERITY
+        if entry.get("_wasAborted") is True:
+            return NETWORK_ABORTED_SEVERITY
+        return NETWORK_UNKNOWN_SEVERITY
+    return NETWORK_SEVERITY_BY_STATUS_CLASS.get(status // 100, DEFAULT_NETWORK_SEVERITY)
+
+
+def _sanitize_url(value: Any) -> str:
+    """Strip secrets from a URL while preserving its diagnostic shape.
+
+    Credentials become ``***``, the fragment is dropped because it never reaches
+    the server, and query values are replaced while their names survive: the name
+    is usually the useful signal and the value is where tokens hide.
+    """
+    if not isinstance(value, str) or not value:
+        return UNKNOWN_FIELD
+    try:
+        split = urlsplit(value)
+        if split.scheme and not split.netloc and not value.startswith(f"{split.scheme}://"):
+            # An opaque URL such as data:, blob:, or javascript: keeps its whole
+            # payload in the path, so only the scheme is safe to report.
+            return f"{split.scheme}:{REDACTED_FIELD}"
+        query = "&".join(
+            pair if "=" not in pair else f"{pair.split('=', 1)[0]}={REDACTED_FIELD}"
+            for pair in split.query.split("&")
+            if pair
+        )
+        path = split.path if split.netloc else _redact_authority_credentials(split.path)
+        sanitized = urlunsplit(
+            (split.scheme, _redact_userinfo(split.netloc), path, query, "")
+        )
+    except ValueError:
+        # The URL is unparsable, so drop everything that can carry a secret and
+        # redact credentials by hand rather than trusting the raw text.
+        sanitized = _redact_unparsable_userinfo(value.split("#", 1)[0].split("?", 1)[0])
+    if not sanitized:
+        # Everything the URL contained was unsafe, so report nothing rather than
+        # an empty field that would read as a real request to a bare host.
+        return UNKNOWN_FIELD
+    if len(sanitized) > MAX_NETWORK_URL_LENGTH:
+        return sanitized[:MAX_NETWORK_URL_LENGTH] + "\u2026"
+    return sanitized
+
+
+def _redact_userinfo(netloc: str) -> str:
+    """Replace any ``user:password`` prefix with ``***``, keeping the host visible."""
+    if "@" not in netloc:
+        return netloc
+    return f"***@{netloc.rsplit('@', 1)[1]}"
+
+
+def _redact_unparsable_userinfo(url: str) -> str:
+    """Redact credentials in a URL that ``urlsplit`` refused to parse."""
+    scheme, separator, remainder = url.partition("://")
+    if not separator:
+        return _redact_authority_credentials(url)
+    host, slash, path = remainder.partition("/")
+    return f"{scheme}://{_redact_userinfo(host)}{slash}{path}"
+
+
+def _redact_authority_credentials(value: str) -> str:
+    """Redact ``user:password@`` in text that has no recognizable URL authority.
+
+    Only a ``user:password`` pair is redacted. A bare ``@`` is left alone because
+    it is ordinary path content, as in an ``/@scope/package`` request.
+    """
+    if "@" not in value:
+        return value
+    prefix, _, remainder = value.rpartition("@")
+    boundary = max(prefix.rfind(character) for character in ("/", "\\"))
+    credentials = prefix[boundary + 1 :]
+    if ":" not in credentials:
+        return value
+    return f"{prefix[: boundary + 1]}***@{remainder}"
 
 
 def _stdio_text(event: dict[str, Any]) -> str | None:

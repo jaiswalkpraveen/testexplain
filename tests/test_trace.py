@@ -20,6 +20,89 @@ def _json_lines(*events: object) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _snapshot(**overrides: object) -> dict:
+    """Build one ``resource-snapshot`` event using harTracer's real sentinel defaults.
+
+    Playwright creates every HAR entry pre-filled with "unknown" sentinels
+    (``status: -1``, ``time: -1``, ``mimeType: "x-unknown"``) and overwrites them
+    only once the real values arrive. Keyword overrides are routed to the request,
+    the response, or the entry itself so each test states just what it varies.
+    """
+    request = {
+        "method": "GET",
+        "url": "https://example.test/",
+        "httpVersion": "HTTP/1.1",
+        "headers": [],
+        "cookies": [],
+        "queryString": [],
+        "headersSize": -1,
+        "bodySize": -1,
+    }
+    response = {
+        "status": -1,
+        "statusText": "",
+        "httpVersion": "HTTP/1.1",
+        "headers": [],
+        "cookies": [],
+        "content": {"size": -1, "mimeType": "x-unknown"},
+        "redirectURL": "",
+        "headersSize": -1,
+        "bodySize": -1,
+        "_transferSize": -1,
+    }
+    snapshot = {
+        "_frameref": "frame@1",
+        "_monotonicTime": 520.0,
+        "cache": {},
+        "pageref": "page@1",
+        "request": request,
+        "response": response,
+        "startedDateTime": "2026-07-25T00:00:00.000Z",
+        "time": -1,
+        "timings": {"send": -1, "wait": -1, "receive": -1},
+    }
+    for key, value in overrides.items():
+        if key in ("method", "url", "postData"):
+            request[key] = value
+        elif key in ("status", "statusText", "_failureText"):
+            response[key] = value
+        elif key == "mimeType":
+            response["content"]["mimeType"] = value
+        else:
+            snapshot[key] = value
+    return {"type": "resource-snapshot", "snapshot": snapshot}
+
+
+NETWORK_CONTEXT = {
+    "version": 8,
+    "type": "context-options",
+    "origin": "library",
+    "wallTime": 2_000_000,
+    "monotonicTime": 500.0,
+}
+
+
+def write_paired_network_trace(
+    path: Path,
+    *snapshots: object,
+    stem: str = "0-trace",
+    trace_events: tuple = (),
+) -> Path:
+    """Write a trace whose ``<stem>.network`` member is paired with ``<stem>.trace``.
+
+    Playwright never stores ``resource-snapshot`` records in the ``.trace`` member.
+    It writes them to a sibling ``.network`` stream that carries no
+    ``context-options`` header of its own, so the reader must inherit the schema
+    version and the clock anchor from the paired ``.trace`` member.
+    """
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            f"{stem}.trace", _json_lines(*(trace_events or (NETWORK_CONTEXT,)))
+        )
+        archive.writestr(f"{stem}.network", _json_lines(*snapshots))
+    return path
+
+
 def write_real_derived_trace(path: Path) -> Path:
     """Write a tiny, sanitized trace shaped from a real Playwright 1.58.2 trace.
 
@@ -829,3 +912,441 @@ def test_read_trace_actions_applies_task_4_safety_rules_to_console_and_output(tm
 
     assert [evidence.summary for evidence in capped.evidence] == ["error: kept"]
     assert any("evidence limit exceeded" in warning for warning in capped.warnings)
+
+
+def test_read_trace_actions_normalizes_paired_network_members(tmp_path):
+    trace = tmp_path / "trace.zip"
+    write_paired_network_trace(
+        trace,
+        _snapshot(
+            url="https://example.test/dead-endpoint",
+            _failureText="net::ERR_UNSAFE_PORT",
+            _monotonicTime=501.0,
+        ),
+        _snapshot(
+            url="https://example.test/",
+            status=200,
+            statusText="OK",
+            mimeType="text/html",
+            time=1.3,
+            _monotonicTime=502.0,
+        ),
+        _snapshot(
+            url="https://example.test/api/slow-ok",
+            status=200,
+            statusText="OK",
+            mimeType="application/json",
+            time=351.6,
+            _monotonicTime=503.0,
+        ),
+        _snapshot(
+            url="https://example.test/api/missing",
+            status=404,
+            statusText="Not Found",
+            mimeType="application/json",
+            time=2.5,
+            _monotonicTime=504.0,
+        ),
+        _snapshot(
+            url="https://example.test/api/broken",
+            status=500,
+            statusText="Internal Server Error",
+            mimeType="application/json",
+            time=2.3,
+            _monotonicTime=505.0,
+        ),
+    )
+
+    result = read_trace_actions(trace)
+
+    assert [(item.source, item.provenance) for item in result.evidence] == [("network", "trace")] * 5
+    assert [item.summary for item in result.evidence] == [
+        "GET https://example.test/dead-endpoint | status=unknown | mime=unknown"
+        " | time=unknown | failure=net::ERR_UNSAFE_PORT",
+        "GET https://example.test/ | status=200 OK | mime=text/html | time=1.3ms",
+        "GET https://example.test/api/slow-ok | status=200 OK | mime=application/json | time=351.6ms",
+        "GET https://example.test/api/missing | status=404 Not Found | mime=application/json | time=2.5ms",
+        "GET https://example.test/api/broken | status=500 Internal Server Error"
+        " | mime=application/json | time=2.3ms",
+    ]
+    assert [item.severity for item in result.evidence] == [4, 1, 1, 3, 4]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_inherits_the_clock_anchor_for_network_members(tmp_path):
+    trace = tmp_path / "trace.zip"
+    anchored = tmp_path / "anchored.zip"
+    write_paired_network_trace(
+        trace,
+        _snapshot(status=200, statusText="OK", _monotonicTime=520.0),
+        _snapshot(status=200, statusText="OK", _monotonicTime=None),
+    )
+
+    result = read_trace_actions(trace)
+
+    assert [item.timestamp_ms for item in result.evidence] == [2_000_020.0, None]
+    assert result.warnings == []
+
+    write_paired_network_trace(
+        anchored,
+        _snapshot(status=200, statusText="OK", _monotonicTime=520.0),
+        trace_events=({"version": 8, "type": "context-options"},),
+    )
+
+    unanchored = read_trace_actions(anchored)
+
+    assert [item.timestamp_ms for item in unanchored.evidence] == [None]
+    assert unanchored.warnings == ["0-trace.trace: missing usable clock anchor"]
+
+
+def test_read_trace_actions_skips_a_network_member_without_a_paired_trace_stream(tmp_path):
+    trace = tmp_path / "trace.zip"
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.network", _json_lines(_snapshot(status=200, statusText="OK")))
+        archive.writestr("1-trace.trace", _json_lines(NETWORK_CONTEXT))
+
+    result = read_trace_actions(trace)
+
+    assert result.evidence == []
+    assert result.warnings == [
+        "0-trace.network: network member has no paired trace stream; skipped"
+    ]
+
+
+def test_read_trace_actions_excludes_network_members_of_an_unusable_trace_stream(tmp_path):
+    trace = tmp_path / "trace.zip"
+    snapshot = _snapshot(status=500, statusText="Internal Server Error", time=1.0)
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr(
+            "0-trace.trace",
+            _json_lines({"version": 999, "type": "context-options", "wallTime": 1, "monotonicTime": 1}),
+        )
+        archive.writestr("0-trace.network", _json_lines(snapshot))
+        archive.writestr("1-trace.trace", _json_lines({"type": "console", "time": 1, "text": "no context"}))
+        archive.writestr("1-trace.network", _json_lines(snapshot))
+        archive.writestr("2-trace.trace", _json_lines(NETWORK_CONTEXT))
+        archive.writestr("2-trace.network", _json_lines(snapshot))
+
+    result = read_trace_actions(trace)
+
+    assert [item.source for item in result.evidence] == ["network"]
+    assert result.evidence[0].timestamp_ms == 2_000_020.0
+    assert any("unsupported trace version 999" in warning for warning in result.warnings)
+    assert any("1-trace.trace: missing context-options" in warning for warning in result.warnings)
+    assert not any("network member has no paired trace stream" in warning for warning in result.warnings)
+
+
+def test_read_trace_actions_flags_transport_failures_and_aborted_requests(tmp_path):
+    trace = tmp_path / "trace.zip"
+    write_paired_network_trace(
+        trace,
+        _snapshot(method="POST", url="https://example.test/gone", _failureText="net::ERR_CONNECTION_REFUSED"),
+        _snapshot(url="https://example.test/cancelled", _wasAborted=True),
+        _snapshot(url="https://example.test/mocked", status=200, statusText="OK", time=0.0, _wasFulfilled=True),
+        _snapshot(url="https://example.test/passthrough", status=200, statusText="OK", time=0.0, _wasContinued=True),
+    )
+
+    result = read_trace_actions(trace)
+
+    assert [item.summary for item in result.evidence] == [
+        "POST https://example.test/gone | status=unknown | mime=unknown"
+        " | time=unknown | failure=net::ERR_CONNECTION_REFUSED",
+        "GET https://example.test/cancelled | status=unknown | mime=unknown | time=unknown | aborted",
+        "GET https://example.test/mocked | status=200 OK | mime=unknown | time=0.0ms | fulfilled",
+        "GET https://example.test/passthrough | status=200 OK | mime=unknown | time=0.0ms | continued",
+    ]
+    assert [item.severity for item in result.evidence] == [4, 3, 1, 1]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_ranks_network_severity_by_status_class(tmp_path):
+    trace = tmp_path / "trace.zip"
+    write_paired_network_trace(
+        trace,
+        _snapshot(status=500, statusText="Internal Server Error"),
+        _snapshot(status=404, statusText="Not Found"),
+        _snapshot(status=302, statusText="Found"),
+        _snapshot(status=200, statusText="OK"),
+        _snapshot(status=101, statusText="Switching Protocols"),
+        _snapshot(status=-1),
+        _snapshot(status="200"),
+        _snapshot(status=True),
+    )
+
+    result = read_trace_actions(trace)
+
+    assert [item.severity for item in result.evidence] == [4, 3, 2, 1, 1, 2, 2, 2]
+    assert [item.summary.split(" | ")[1] for item in result.evidence] == [
+        "status=500 Internal Server Error",
+        "status=404 Not Found",
+        "status=302 Found",
+        "status=200 OK",
+        "status=101 Switching Protocols",
+        "status=unknown",
+        "status=unknown",
+        "status=unknown",
+    ]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_reports_unknown_network_timing_and_mime_type(tmp_path):
+    trace = tmp_path / "trace.zip"
+    write_paired_network_trace(
+        trace,
+        _snapshot(status=200, statusText="OK", time=-1, mimeType="x-unknown"),
+        _snapshot(status=200, statusText="OK", time=0, mimeType="text/css"),
+        _snapshot(status=200, statusText="OK", time=12.34, mimeType=""),
+        _snapshot(status=200, statusText="OK", time="12", mimeType=7),
+        _snapshot(status=200, statusText="OK", time=True, mimeType="application/json; charset=utf-8"),
+    )
+
+    result = read_trace_actions(trace)
+
+    assert [item.summary.split(" | ")[2:] for item in result.evidence] == [
+        ["mime=unknown", "time=unknown"],
+        ["mime=text/css", "time=0.0ms"],
+        ["mime=unknown", "time=12.3ms"],
+        ["mime=unknown", "time=unknown"],
+        ["mime=application/json; charset=utf-8", "time=unknown"],
+    ]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_sanitizes_network_urls(tmp_path):
+    import testexplain.sources.trace as trace_module
+
+    trace = tmp_path / "trace.zip"
+    long_url = "https://example.test/" + "a" * 400
+    write_paired_network_trace(
+        trace,
+        _snapshot(url="https://user:secret@example.test/private"),
+        _snapshot(url="https://example.test/search?token=abcdef&id=7&flag"),
+        _snapshot(url="https://example.test/page#access_token=leaked"),
+        _snapshot(url=long_url),
+        _snapshot(url=""),
+        _snapshot(url=None),
+        _snapshot(url="http://[::1"),
+        _snapshot(url="https://user:secret@[::1?token=abcdef"),
+    )
+
+    result = read_trace_actions(trace)
+    urls = [item.summary.split(" | ")[0].removeprefix("GET ") for item in result.evidence]
+
+    assert urls[0] == "https://***@example.test/private"
+    assert urls[1] == "https://example.test/search?token=<redacted>&id=<redacted>&flag"
+    assert urls[2] == "https://example.test/page"
+    assert urls[3] == long_url[: trace_module.MAX_NETWORK_URL_LENGTH] + "\u2026"
+    assert len(urls[3]) == trace_module.MAX_NETWORK_URL_LENGTH + 1
+    assert urls[4] == "unknown"
+    assert urls[5] == "unknown"
+    assert urls[6] == "http://[::1"
+    assert "secret" not in urls[7] and "abcdef" not in urls[7]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_isolates_malformed_network_records(tmp_path):
+    trace = tmp_path / "trace.zip"
+    write_paired_network_trace(
+        trace,
+        {"type": "resource-snapshot", "snapshot": None},
+        {"type": "resource-snapshot", "snapshot": []},
+        {"type": "resource-snapshot"},
+        {"type": "resource-snapshot", "snapshot": {"response": {"status": 200}}},
+        {"type": "resource-snapshot", "snapshot": {"request": ["GET"]}},
+        {"type": "resource-snapshot", "snapshot": {"request": {"method": "HEAD", "url": "https://example.test/a"}}},
+        {
+            "type": "resource-snapshot",
+            "snapshot": {"request": {"method": 5, "url": 7}, "response": "broken", "time": 1.0},
+        },
+        "{not valid json",
+        [],
+        '{"type":"resource-snapshot","snapshot":{"request":{"method":"GET","url":"https://example.test/b"},"_monotonicTime":NaN}}',
+    )
+
+    result = read_trace_actions(trace)
+
+    assert [item.summary for item in result.evidence] == [
+        "HEAD https://example.test/a | status=unknown | mime=unknown | time=unknown",
+        "UNKNOWN unknown | status=unknown | mime=unknown | time=1.0ms",
+    ]
+    assert sum("unusable resource-snapshot payload" in warning for warning in result.warnings) == 5
+    assert any("0-trace.network line 8" in warning and "malformed JSON" in warning for warning in result.warnings)
+    assert any("0-trace.network line 9" in warning and "expected JSON object" in warning for warning in result.warnings)
+    assert any("0-trace.network line 10" in warning and "malformed JSON" in warning for warning in result.warnings)
+
+
+def test_read_trace_actions_applies_safety_limits_to_network_members(tmp_path, monkeypatch):
+    import testexplain.sources.trace as trace_module
+
+    trace = tmp_path / "trace.zip"
+    write_paired_network_trace(
+        trace,
+        _snapshot(url="https://example.test/first", status=200, statusText="OK"),
+        _snapshot(url="https://example.test/second", status=200, statusText="OK"),
+    )
+
+    monkeypatch.setattr(trace_module, "MAX_TRACE_EVIDENCE", 1)
+    capped = read_trace_actions(trace)
+
+    assert len(capped.evidence) == 1
+    assert "https://example.test/first" in capped.evidence[0].summary
+    assert any("evidence limit exceeded" in warning for warning in capped.warnings)
+
+    monkeypatch.setattr(trace_module, "MAX_TRACE_EVIDENCE", 50_000)
+    monkeypatch.setattr(trace_module, "MAX_TRACE_EVENTS", 1)
+    event_capped = read_trace_actions(trace)
+
+    assert event_capped.evidence == []
+    assert any("0-trace.network" in warning and "event limit" in warning for warning in event_capped.warnings)
+
+    monkeypatch.setattr(trace_module, "MAX_TRACE_EVENTS", 100_000)
+    monkeypatch.setattr(trace_module, "MAX_TRACE_LINE_LENGTH", 200)
+    line_capped = read_trace_actions(trace)
+
+    assert line_capped.evidence == []
+    assert any(
+        "0-trace.network line 1" in warning and "line length limit" in warning
+        for warning in line_capped.warnings
+    )
+
+    monkeypatch.setattr(trace_module, "MAX_TRACE_LINE_LENGTH", 1024 * 1024)
+    monkeypatch.setattr(trace_module, "MAX_TRACE_MEMBER_SIZE", 200)
+    size_capped = read_trace_actions(trace)
+
+    assert size_capped.evidence == []
+    assert any(
+        "0-trace.network" in warning and "member size limit" in warning
+        for warning in size_capped.warnings
+    )
+
+
+def test_read_trace_actions_keeps_network_streams_isolated_per_ordinal(tmp_path):
+    trace = tmp_path / "trace.zip"
+    first_context = {"version": 8, "type": "context-options", "wallTime": 1_000_000, "monotonicTime": 100.0}
+    second_context = {"version": 8, "type": "context-options", "wallTime": 5_000_000, "monotonicTime": 900.0}
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.trace", _json_lines(first_context))
+        archive.writestr("0-trace.network", _json_lines(_snapshot(status=200, statusText="OK", _monotonicTime=110.0)))
+        archive.writestr("1-trace.trace", _json_lines(second_context))
+        archive.writestr("1-trace.network", _json_lines(_snapshot(status=200, statusText="OK", _monotonicTime=910.0)))
+
+    result = read_trace_actions(trace)
+
+    assert [item.timestamp_ms for item in result.evidence] == [1_000_010.0, 5_000_010.0]
+    assert result.warnings == []
+
+
+def test_read_trace_actions_parses_inline_resource_snapshots(tmp_path):
+    trace = tmp_path / "trace.zip"
+    events = [
+        NETWORK_CONTEXT,
+        {"type": "before", "callId": "call@1", "startTime": 510.0, "title": "navigate"},
+        _snapshot(url="https://example.test/inline", status=503, statusText="Service Unavailable", time=4.0),
+        {"type": "after", "callId": "call@1", "endTime": 520.0, "result": {"status": "ok"}},
+    ]
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.trace", _json_lines(*events))
+
+    result = read_trace_actions(trace)
+
+    assert [(item.source, item.severity) for item in result.evidence] == [("network", 4), ("action", 1)]
+    assert result.evidence[0].summary == (
+        "GET https://example.test/inline | status=503 Service Unavailable | mime=unknown | time=4.0ms"
+    )
+    assert result.warnings == []
+
+
+def test_read_trace_actions_bounds_the_number_of_network_members(tmp_path, monkeypatch):
+    import testexplain.sources.trace as trace_module
+
+    trace = tmp_path / "trace.zip"
+    snapshot = _snapshot(status=200, statusText="OK")
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.trace", _json_lines(NETWORK_CONTEXT))
+        archive.writestr("0-trace.network", _json_lines(snapshot))
+        archive.writestr("9-orphan.network", _json_lines(snapshot))
+
+    monkeypatch.setattr(trace_module, "MAX_TRACE_MEMBERS", 1)
+    result = read_trace_actions(trace)
+
+    assert [item.source for item in result.evidence] == ["network"]
+    assert any("network member limit exceeded" in warning for warning in result.warnings)
+    assert not any("no paired trace stream" in warning for warning in result.warnings)
+
+
+def test_read_trace_actions_pairs_network_members_by_exact_ordinal(tmp_path):
+    trace = tmp_path / "trace.zip"
+    snapshot = _snapshot(status=200, statusText="OK")
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.trace", _json_lines(NETWORK_CONTEXT))
+        archive.writestr("10-trace.network", _json_lines(snapshot))
+        archive.writestr("resources/0-trace.network", _json_lines(snapshot))
+        archive.writestr(".network", _json_lines(snapshot))
+
+    result = read_trace_actions(trace)
+
+    assert result.evidence == []
+    assert sorted(result.warnings) == [
+        ".network: network member has no paired trace stream; skipped",
+        "10-trace.network: network member has no paired trace stream; skipped",
+        "resources/0-trace.network: network member has no paired trace stream; skipped",
+    ]
+
+
+def test_read_trace_actions_keeps_network_evidence_when_a_sibling_member_is_unreadable(tmp_path):
+    trace = tmp_path / "trace.zip"
+    with zipfile.ZipFile(trace, "w") as archive:
+        archive.writestr("0-trace.trace", _json_lines(NETWORK_CONTEXT))
+        archive.writestr(
+            "0-trace.network",
+            _json_lines(_snapshot(url="https://example.test/kept", status=200, statusText="OK")),
+        )
+        archive.writestr("1-trace.trace", _json_lines(NETWORK_CONTEXT))
+        archive.writestr(
+            "1-trace.network",
+            _json_lines(_snapshot(url="https://example.test/lost", status=200, statusText="OK")),
+            compress_type=zipfile.ZIP_STORED,
+        )
+
+    with zipfile.ZipFile(trace) as archive:
+        info = archive.getinfo("1-trace.network")
+    payload = info.header_offset + 30 + len(info.filename) + len(info.extra)
+    raw = bytearray(trace.read_bytes())
+    raw[payload : payload + 1] = b"\x00"
+    trace.write_bytes(bytes(raw))
+
+    result = read_trace_actions(trace)
+
+    assert [item.summary.split(" | ")[0] for item in result.evidence] == [
+        "GET https://example.test/kept"
+    ]
+    assert any("1-trace.network" in warning for warning in result.warnings)
+
+
+def test_read_trace_actions_redacts_opaque_and_pathological_urls(tmp_path):
+    trace = tmp_path / "trace.zip"
+    write_paired_network_trace(
+        trace,
+        _snapshot(url="#access_token=leaked"),
+        _snapshot(url="data:text/plain;base64,c2VjcmV0"),
+        _snapshot(url="javascript:alert('secret')"),
+        _snapshot(url="/api/profile?token=secret"),
+        _snapshot(url="\\\\user:secret@host\\share"),
+        _snapshot(url="https://example.test/@scope/pkg"),
+        _snapshot(url="blob:https://example.test/9f8e"),
+    )
+
+    result = read_trace_actions(trace)
+    urls = [item.summary.split(" | ")[0].removeprefix("GET ") for item in result.evidence]
+
+    assert urls == [
+        "unknown",
+        "data:<redacted>",
+        "javascript:<redacted>",
+        "/api/profile?token=<redacted>",
+        "\\\\***@host\\share",
+        "https://example.test/@scope/pkg",
+        "blob:<redacted>",
+    ]
+    assert not any("secret" in url for url in urls)
+    assert result.warnings == []
