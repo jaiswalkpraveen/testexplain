@@ -4,7 +4,7 @@
 
 TestExplain is an AI-native test-failure triage platform. It ingests Playwright reports and uses an LLM to explain, in plain English, why each test failed and what to check first. It's built milestone-by-milestone as a learning-grade, framework-free AI engineering project.
 
-**Status:** Milestone 0 established the walking skeleton. Milestone 1 adds structured, validated LLM output with corrective retries.
+**Status:** Milestone 0 established the walking skeleton. Milestone 1 adds structured, validated LLM output with corrective retries. Milestone 2 now builds multi-source, redacted evidence before prompt composition.
 
 ## Milestone progress
 
@@ -68,6 +68,41 @@ Next steps:
 ```
 
 The prompt asks for JSON, but TestExplain does not trust the model to comply. Every reply is parsed and validated at the system boundary. Invalid JSON, invented categories, missing fields, or out-of-range confidence values trigger a corrective retry.
+
+### M2 — Multi-source context and safe evidence
+
+M2 moves the pipeline from one failure summary to attempt-aware evidence assembled from the artifacts that explain a failure:
+
+```text
+report.json or bundle.zip
+          │
+          ▼
+ safe input reader ──▶ attempt-aware report parser
+          │                         │
+          └──────────────┬──────────┘
+                         ▼
+              trace and HAR adapters
+                         │
+                         ▼
+                 normalized Evidence
+                         │
+                         ▼
+        deterministic redaction before prompt composition
+```
+
+M2 Tasks 1–8 now provide:
+
+- typed `Evidence` and `FailedAttempt` contracts with provenance and severity
+- recursive, retry-aware Playwright report ingestion
+- safe report and bundle input handling with bounded artifact access
+- trace evidence for actions, console messages, page errors, stdout, stderr, and network events
+- HAR fallback evidence with bounded response-body previews
+- deterministic, idempotent redaction of authorization values, cookies, API keys, query secrets, JSON secret fields, and vendor-prefixed tokens
+- pure redaction helpers that preserve evidence metadata while returning new objects
+
+The security boundary is deliberate: redaction happens before evidence is composed into a prompt. This matters because prompt content is sent to a third-party model, and the model may quote evidence in its response. Generic URL path segments and locator-shaped action arguments remain documented limitations because they cannot be distinguished reliably from ordinary diagnostic values without more context.
+
+The current M2 suite has **266 passing tests**. Tasks 9 onward will rank, deduplicate, and budget evidence before prompt construction.
 
 ## Gateway design
 
@@ -166,10 +201,17 @@ The automated suite uses `FakeGateway`, so it requires no API key, makes no netw
 
 ```text
 src/testexplain/
-├── models.py                 # FailureContext and structured FailureAnalysis contracts
+├── models.py # FailureContext, Evidence, and FailureAnalysis contracts
 ├── ingestion/
-│   └── playwright.py         # Playwright JSON → list[FailureContext]
-├── gateway.py                # Gateway Protocol and fake/real implementations
+│ ├── input_reader.py # safe report/bundle input
+│ └── playwright.py # Playwright JSON → attempts and failure contexts
+├── sources/
+│ ├── trace.py # Playwright trace → normalized evidence
+│ ├── har.py # HAR → fallback network evidence
+│ └── common.py # shared source-adapter primitives
+├── assembly/
+│ └── redact.py # deterministic secret redaction before prompts
+├── gateway.py # Gateway Protocol and fake/real implementations
 ├── core.py                   # prompt, parse, validate, retry, and orchestration pipeline
 ├── cli.py                    # testexplain analyze
 └── api.py                    # FastAPI /analyze endpoint
@@ -179,6 +221,6 @@ docs/milestones/              # per-milestone learning notes
 
 ## Roadmap
 
-M0 walking skeleton (done) → **M1 structured outputs (done)** → multi-source context → categorization → **eval harness** → embeddings/vector DB → RAG → flaky detection → debugging agent → Slack → MCP server → multi-agent → production hardening.
+M0 walking skeleton (done) → **M1 structured outputs (done)** → **M2 multi-source context and redaction (Tasks 1–8 done)** → M2 evidence ranking and budgeting → categorization → **eval harness** → embeddings/vector DB → RAG → flaky detection → debugging agent → Slack → MCP server → multi-agent → production hardening.
 
 The eval harness (M4) is the centerpiece: rigorous, testable evaluation of a non-deterministic system — the SDET-to-AI-engineer bridge.
