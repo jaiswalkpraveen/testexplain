@@ -1,16 +1,20 @@
+import json
 from pathlib import Path
 from typing import get_args
 
 import pytest
 
+from testexplain.core import analyze_input
 from testexplain.core import (
-    analyze_report,
-    build_prompt,
-    generate_analysis,
-    parse_analysis,
+analyze_report,
+build_prompt,
+generate_analysis,
+parse_analysis,
 )
+from testexplain.assembly.assembler import AssembledEvidence, TruncationInfo
 from testexplain.gateway import FakeGateway
-from testexplain.models import Category, FailureAnalysis, FailureContext
+from testexplain.models import Category, Evidence, FailureAnalysis, FailureContext
+from testexplain.sources.common import SourceResult
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
 
@@ -61,6 +65,37 @@ def test_build_prompt_demands_json_only_response():
     for field in ("summary", "suspected_category", "evidence",
                   "next_steps", "confidence"):
         assert f'"{field}"' in prompt
+
+
+def test_build_prompt_groups_evidence_and_reports_budget_gaps():
+    assembled = AssembledEvidence(
+        evidence=[
+            Evidence(source="action", provenance="trace", summary="click checkout"),
+            Evidence(source="stdout", provenance="report", summary="started"),
+            Evidence(source="network", provenance="har", summary="503 on /checkout"),
+        ],
+        warnings=["trace was partially unreadable"],
+        truncation=TruncationInfo(
+            total_budget=10,
+            used_tokens=10,
+            section_tokens={"actions": 3, "console_output": 2, "network": 5},
+            omitted_count=2,
+            truncated_count=1,
+            deduplicated_count=1,
+        ),
+    )
+
+    prompt = build_prompt(make_failure(), evidence=assembled)
+
+    for section in ("[Actions]", "[Console/output]", "[Network]"):
+        assert section in prompt
+    assert "[trace]" in prompt
+    assert "[report]" in prompt
+    assert "[har]" in prompt
+    assert "trace was partially unreadable" in prompt
+    assert "truncated" in prompt
+    assert "omitted for budget" in prompt
+    assert "duplicate network" in prompt
 
 
 def test_parse_analysis_accepts_clean_json():
@@ -148,3 +183,125 @@ def test_analyze_report_runs_pipeline_with_fake_gateway():
     # The gateway was actually called once, with a prompt containing evidence.
     assert len(gateway.calls) == 1
     assert "Timeout 30000ms exceeded" in gateway.calls[0]
+
+
+def _write_attempt_report(path: Path, *, attachments=None, status="flaky") -> Path:
+    report = {
+        "config": {},
+        "errors": [],
+        "stats": {},
+        "suites": [
+            {
+                "title": "checkout.spec.ts",
+                "specs": [
+                    {
+                        "title": "user checks out",
+                        "id": "checkout-1",
+                        "tests": [
+                            {
+                                "projectId": "chromium-id",
+                                "projectName": "chromium",
+                                "status": status,
+                                "results": [
+                                    {
+                                        "retry": 1,
+                                        "status": "failed",
+                                        "duration": 1234,
+                                        "startTime": "2026-08-15T10:00:00Z",
+                                        "error": {
+                                            "message": "checkout timed out",
+                                            "stack": "TimeoutError: checkout timed out",
+                                        },
+                                        "stdout": ["checkout started"],
+                                        "attachments": attachments or [],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    path.write_text(json.dumps(report))
+    return path
+
+
+def test_analyze_input_includes_evidence_and_known_attempt_identity(tmp_path, monkeypatch):
+    report = _write_attempt_report(
+        tmp_path / "report.json",
+        attachments=[{"name": "run.trace.zip", "path": "run.trace.zip"}],
+    )
+    (tmp_path / "run.trace.zip").write_bytes(b"trace")
+    evidence = Evidence(
+        source="network",
+        provenance="trace",
+        summary="POST https://app.test/checkout | status=503 Service Unavailable",
+        severity=4,
+        timestamp_ms=1200,
+    )
+    monkeypatch.setattr("testexplain.core.read_trace_actions", lambda path: SourceResult([evidence], []))
+    gateway = FakeGateway(response=VALID_JSON_REPLY)
+    results = analyze_input(report, gateway)
+
+    assert len(results) == 1
+    assert results[0].project == "chromium"
+    assert results[0].retry == 1
+    assert results[0].flaky is True
+    assert "POST https://app.test/checkout" in gateway.calls[0]
+    assert "Network" in gateway.calls[0]
+    assert "[trace]" in gateway.calls[0]
+
+
+def test_analyze_input_keeps_report_evidence_and_artifact_warnings(tmp_path):
+    report = _write_attempt_report(
+        tmp_path / "report.json",
+        attachments=[{"name": "missing.trace.zip", "path": "missing.trace.zip"}],
+        status="unexpected",
+    )
+    gateway = FakeGateway(response=VALID_JSON_REPLY)
+
+    results = analyze_input(report, gateway)
+
+    assert len(results) == 1
+    assert "checkout started" in gateway.calls[0]
+    assert "does not exist" in gateway.calls[0]
+
+
+def test_analyze_input_redacts_report_evidence_before_gateway(tmp_path):
+    report = _write_attempt_report(tmp_path / "report.json")
+    data = json.loads(report.read_text())
+    data["suites"][0]["specs"][0]["tests"][0]["results"][0]["stdout"] = [
+        "Authorization: Bearer secret-token"
+    ]
+    report.write_text(json.dumps(data))
+    gateway = FakeGateway(response=VALID_JSON_REPLY)
+
+    analyze_input(report, gateway)
+
+    assert "secret-token" not in gateway.calls[0]
+    assert "<redacted>" in gateway.calls[0]
+
+
+def test_analyze_input_generates_one_analysis_per_failed_attempt(tmp_path):
+    report = _write_attempt_report(tmp_path / "report.json")
+    data = json.loads(report.read_text())
+    results = data["suites"][0]["specs"][0]["tests"][0]["results"]
+    results.append(
+        {
+            "retry": 2,
+            "status": "timedOut",
+            "duration": 2000,
+            "startTime": "2026-08-15T10:01:00Z",
+            "error": {"message": "checkout still timed out"},
+        }
+    )
+    report.write_text(json.dumps(data))
+    gateway = FakeGateway(response=VALID_JSON_REPLY)
+
+    analyses = analyze_input(report, gateway)
+
+    assert len(analyses) == 2
+    assert len(gateway.calls) == 2
+    assert "Retry: 1" in gateway.calls[0]
+    assert "Retry: 2" in gateway.calls[1]
