@@ -107,16 +107,22 @@
       </div>
     </div>
 
-    <div class="card">
-      <h2>Playwright report</h2>
-      <label class="file-label">
-        <span class="file-btn">&#128194; Choose JSON file</span>
-        <input type="file" id="fileInput" accept=".json">
-      </label>
-      <span id="fileName" style="font-size:.8rem;color:#666;margin-left:.5rem;"></span>
-      <div class="or-divider">— or paste JSON below —</div>
-      <textarea id="reportText" placeholder='{"suites": [...]}'></textarea>
-    </div>
+<div class="card">
+<h2>Playwright report</h2>
+<label class="file-label">
+<span class="file-btn">&#128194; Choose JSON file</span>
+<input type="file" id="fileInput" accept=".json">
+</label>
+<span id="fileName" style="font-size:.8rem;color:#666;margin-left:.5rem;"></span>
+<div class="or-divider">— or paste JSON below —</div>
+<textarea id="reportText" placeholder='{"suites": [...]}'></textarea>
+<div class="or-divider">— or upload a bundle ZIP —</div>
+<label class="file-label">
+<span class="file-btn">&#128230; Choose bundle ZIP</span>
+<input type="file" id="zipInput" accept=".zip">
+</label>
+<span id="zipName" style="font-size:.8rem;color:#666;margin-left:.5rem;"></span>
+</div>
 
     <button type="submit" id="submitBtn">
       <span class="label-text">Analyze</span>
@@ -133,73 +139,159 @@ const form = document.getElementById("analyzeForm");
 const fileInput = document.getElementById("fileInput");
 const reportText = document.getElementById("reportText");
 const fileName = document.getElementById("fileName");
+const zipInput = document.getElementById("zipInput");
+const zipName = document.getElementById("zipName");
 const errorDiv = document.getElementById("error");
 const resultsDiv = document.getElementById("results");
 const submitBtn = document.getElementById("submitBtn");
 
+let selectedZip = null;
+let pendingJsonRead = false;
+
+// Keep in sync with MAX_BUNDLE_UPLOAD_BYTES in api.py.
+const MAX_BUNDLE_BYTES = 50 * 1024 * 1024;
+
+// Generation counter: a stale FileReader callback must not repopulate the
+// textarea after the user has switched to a ZIP (or a newer JSON file).
+let readToken = 0;
+
+function clearZipSelection() {
+selectedZip = null;
+zipInput.value = "";
+zipName.textContent = "";
+}
+
+function finishJsonRead(token) {
+ if (token === readToken) {
+ pendingJsonRead = false;
+ submitBtn.disabled = false;
+ }
+}
+
 fileInput.addEventListener("change", () => {
-  const file = fileInput.files[0];
-  if (file) {
-    fileName.textContent = file.name;
-    const reader = new FileReader();
-    reader.onload = (e) => { reportText.value = e.target.result; };
-    reader.readAsText(file);
-  }
+const file = fileInput.files[0];
+if (file) {
+ clearZipSelection();
+ fileName.textContent = file.name;
+ reportText.value = "";
+ pendingJsonRead = true;
+ submitBtn.disabled = true;
+ const token = ++readToken;
+ const reader = new FileReader();
+ reader.onload = (e) => { if (token === readToken) reportText.value = e.target.result; };
+ reader.onerror = () => { if (token === readToken) errorDiv.textContent = `Could not read ${file.name}.`; };
+ reader.onloadend = () => finishJsonRead(token);
+ reader.readAsText(file);
+}
 });
 
+reportText.addEventListener("input", () => {
+ readToken++; // manual edits invalidate any pending file read
+ pendingJsonRead = false;
+ submitBtn.disabled = false;
+if (reportText.value) clearZipSelection();
+});
+
+zipInput.addEventListener("change", () => {
+const file = zipInput.files[0];
+if (file) {
+ readToken++; // invalidate any pending JSON read
+ pendingJsonRead = false;
+ submitBtn.disabled = false;
+selectedZip = file;
+zipName.textContent = file.name;
+reportText.value = "";
+fileInput.value = "";
+fileName.textContent = "";
+}
+});
+
+async function responseError(res) {
+ const text = await res.text();
+ try {
+ const err = JSON.parse(text);
+ if (typeof err.detail === "string") return err.detail;
+ if (Array.isArray(err.detail)) {
+ return err.detail.map((d) => d.msg || JSON.stringify(d)).join("; ");
+ }
+ } catch { /* not JSON — fall through to the generic message */ }
+ return `Server error (${res.status})`;
+}
+
 form.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  errorDiv.textContent = "";
-  resultsDiv.innerHTML = "";
-  submitBtn.classList.add("loading");
-  submitBtn.disabled = true;
+ e.preventDefault();
+ if (pendingJsonRead) {
+ errorDiv.textContent = "Wait for the JSON file to finish loading.";
+ return;
+ }
+ errorDiv.textContent = "";
+resultsDiv.innerHTML = "";
+submitBtn.classList.add("loading");
+submitBtn.disabled = true;
 
-  try {
-    const report = reportText.value;
-    if (!report.trim()) { throw new Error("Paste or upload a Playwright JSON report."); }
+try {
+let res;
+if (selectedZip) {
+ if (selectedZip.size > MAX_BUNDLE_BYTES) {
+ throw new Error("Bundle ZIP exceeds the 50 MiB upload limit.");
+ }
+const formData = new FormData();
+formData.append("bundle", selectedZip);
+const apiKey = document.getElementById("apiKey").value;
+const baseUrl = document.getElementById("baseUrl").value;
+const model = document.getElementById("model").value;
+ if (apiKey) formData.append("api_key", apiKey);
+ if (baseUrl) formData.append("base_url", baseUrl);
+ if (model) formData.append("model", model);
+ // No manual Content-Type: the browser sets the multipart boundary.
+ res = await fetch("/analyze-bundle", { method: "POST", body: formData });
+ } else {
+const report = reportText.value;
+if (!report.trim()) { throw new Error("Paste or upload a Playwright JSON report, or choose a bundle ZIP."); }
 
-    const res = await fetch("/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        report,
-        api_key: document.getElementById("apiKey").value || null,
-        base_url: document.getElementById("baseUrl").value || null,
-        model: document.getElementById("model").value || null,
-      }),
-    });
+ res = await fetch("/analyze", {
+method: "POST",
+headers: { "Content-Type": "application/json" },
+body: JSON.stringify({
+report,
+api_key: document.getElementById("apiKey").value || null,
+base_url: document.getElementById("baseUrl").value || null,
+model: document.getElementById("model").value || null,
+}),
+});
+}
 
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || `Server error (${res.status})`);
-    }
+if (!res.ok) {
+ throw new Error(await responseError(res));
+}
 
-    const data = await res.json();
-    if (!data.length) {
-      resultsDiv.innerHTML = '<div class="card">No failed tests found. All tests passed!</div>';
-      return;
-    }
+const data = await res.json();
+ if (!Array.isArray(data)) { throw new Error(`Unexpected response from server (${res.status}).`); }
+if (!data.length) {
+resultsDiv.innerHTML = '<div class="card">No failed tests found. All tests passed!</div>';
+return;
+}
 
-    data.forEach((a) => {
-      const cat = a.suspected_category.replace(/\s+/g, "-");
-      const conf = (a.confidence * 100).toFixed(0);
-      resultsDiv.innerHTML += `
-        <div class="result-card">
-          <h3>${esc(a.test_title)}</h3>
-          <div class="meta">
-            <span class="badge badge-${cat}">${esc(a.suspected_category)}</span>
-            <span class="confidence">${conf}% confidence</span>
-          </div>
-          <div class="summary">${esc(a.summary)}</div>
-          ${listBlock("Evidence", a.evidence)}
-          ${listBlock("Next steps", a.next_steps)}
-        </div>`;
-    });
-  } catch (err) {
+ resultsDiv.innerHTML = data.map((a) => {
+const cat = a.suspected_category.replace(/\s+/g, "-");
+const conf = (a.confidence * 100).toFixed(0);
+ return `
+<div class="result-card">
+<h3>${esc(a.test_title)}</h3>
+<div class="meta">
+<span class="badge badge-${cat}">${esc(a.suspected_category)}</span>
+<span class="confidence">${conf}% confidence</span>
+</div>
+<div class="summary">${esc(a.summary)}</div>
+${listBlock("Evidence", a.evidence)}
+${listBlock("Next steps", a.next_steps)}
+</div>`;
+ }).join("");
+} catch (err) {
     errorDiv.textContent = err.message;
-  } finally {
-    submitBtn.classList.remove("loading");
-    submitBtn.disabled = false;
+ } finally {
+ submitBtn.classList.remove("loading");
+ submitBtn.disabled = pendingJsonRead;
   }
 });
 

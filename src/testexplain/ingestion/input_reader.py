@@ -17,6 +17,10 @@ MAX_COMPRESSION_RATIO = 100
 COMPRESSION_RATIO_MIN_SIZE = 10 * 1024 * 1024
 
 
+class InvalidBundleError(ValueError):
+    """A ZIP bundle cannot be safely or meaningfully analyzed."""
+
+
 class LoadedInput(BaseModel):
     attempts: list[FailedAttempt]
     artifact_dir: Path | None
@@ -202,5 +206,8 @@ def load_input(path: str | Path) -> LoadedInput:
             allow_external_absolute_paths=True,
         )
     if zipfile.is_zipfile(input_path):
-        return _load_zip(input_path)
-    raise ValueError(f"Input must be a JSON report or ZIP bundle: {input_path}")
+        try:
+            return _load_zip(input_path)
+        except ValueError as exc:
+            raise InvalidBundleError(str(exc)) from exc
+    raise InvalidBundleError(f"Input must be a JSON report or ZIP bundle: {input_path}")

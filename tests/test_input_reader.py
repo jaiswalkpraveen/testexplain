@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from testexplain.ingestion import input_reader
-from testexplain.ingestion.input_reader import LoadedInput, load_input, resolve_attachment_path
+from testexplain.ingestion.input_reader import (
+    InvalidBundleError,
+    LoadedInput,
+    load_input,
+    resolve_attachment_path,
+)
 from testexplain.models import Attachment
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
@@ -84,6 +89,13 @@ def test_load_input_requires_exactly_one_playwright_report(tmp_path, entries):
     bundle = write_bundle(tmp_path / "results.zip", entries)
 
     with pytest.raises(ValueError, match="exactly one Playwright JSON report"):
+        load_input(bundle)
+
+
+def test_load_input_marks_invalid_bundle_errors_with_a_specific_exception(tmp_path):
+    bundle = write_bundle(tmp_path / "results.zip", {"metadata.json": "{}"})
+
+    with pytest.raises(InvalidBundleError, match="exactly one Playwright JSON report"):
         load_input(bundle)
 
 
