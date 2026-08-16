@@ -9,11 +9,15 @@ the reasoning (core analysis), and the LLM (gateway) together, then
 prints the explanations to the terminal.
 """
 
+import json
+from pathlib import Path
+
 import typer
 from dotenv import load_dotenv
 
 from testexplain.core import analyze_report
 from testexplain.gateway import FakeGateway, OpenAICompatibleGateway
+from testexplain.ingestion.package import create_bundle
 
 # Read .env from the project root into os.environ (no-op if absent),
 # so LLM_* vars work without exporting them in every shell.
@@ -62,6 +66,29 @@ def analyze(report_path: str, fake: bool = False):
             print("Next steps:")
             for step in analysis.next_steps:
                 print(f"  - {step}")
+
+
+@app.command()
+def bundle(
+    report_path: str,
+    output: Path = typer.Option(..., "--output", "-o", help="Output ZIP bundle path"),
+):
+    """Package a Playwright report and its failure artifacts into one ZIP.
+
+    Args:
+        report_path: Path to the native Playwright JSON report file.
+        output: Path of the ZIP bundle to write.
+    """
+    try:
+        result = create_bundle(report_path, output)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1)
+
+    # Warnings describe artifacts we could not package; the bundle is still valid.
+    for warning in result.warnings:
+        typer.echo(f"Warning: {warning}", err=True)
+    print(f"Bundled {result.artifact_count} artifacts into {result.output_path}")
 
 
 if __name__ == "__main__":
