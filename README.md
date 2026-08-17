@@ -90,7 +90,7 @@ report.json or bundle.zip
         deterministic redaction before prompt composition
 ```
 
-M2 Tasks 1–8 now provide:
+M2 Tasks 1–13 now provide:
 
 - typed `Evidence` and `FailedAttempt` contracts with provenance and severity
 - recursive, retry-aware Playwright report ingestion
@@ -99,10 +99,15 @@ M2 Tasks 1–8 now provide:
 - HAR fallback evidence with bounded response-body previews
 - deterministic, idempotent redaction of authorization values, cookies, API keys, query secrets, JSON secret fields, and vendor-prefixed tokens
 - pure redaction helpers that preserve evidence metadata while returning new objects
+- deterministic severity/temporal ranking, network deduplication, and a 4,000-token evidence budget
+- attempt-aware prompt orchestration with project, retry, flaky, provenance, and evidence-gap context
+- deterministic CLI bundle packaging with safe rewritten artifact paths
+- multipart ZIP uploads through `POST /analyze-bundle`, with streaming size limits and temporary-file cleanup
+- synthetic production-shaped fixtures and prompt ablation tests proving report-only, trace, and trace-plus-HAR context
 
 The security boundary is deliberate: redaction happens before evidence is composed into a prompt. This matters because prompt content is sent to a third-party model, and the model may quote evidence in its response. Generic URL path segments and locator-shaped action arguments remain documented limitations because they cannot be distinguished reliably from ordinary diagnostic values without more context.
 
-The current M2 suite has **266 passing tests**. Tasks 9 onward will rank, deduplicate, and budget evidence before prompt construction.
+The M2 workflow is documented in [Collecting Playwright Artifacts](docs/guides/collecting-artifacts.md). The guide covers native JSON reports, trace/HAR attachment paths, offline validation, ZIP bundling, API upload, and troubleshooting.
 
 ## Gateway design
 
@@ -176,6 +181,17 @@ GET /analyze?report_path=tests/fixtures/sample_report.json&fake=true
 
 Use `fake=true` for an offline dry run or `fake=false` for the configured real endpoint.
 
+To analyze a bundled report through the API:
+
+```bash
+curl -X POST http://127.0.0.1:8000/analyze-bundle \
+  -F "bundle=@artifacts/failure-bundle.zip" \
+  -F "fake=true"
+```
+
+See the [artifact collection guide](docs/guides/collecting-artifacts.md) for
+the complete report, trace, HAR, bundling, and troubleshooting workflow.
+
 ## Testing
 
 ```bash
@@ -221,6 +237,6 @@ docs/milestones/              # per-milestone learning notes
 
 ## Roadmap
 
-M0 walking skeleton (done) → **M1 structured outputs (done)** → **M2 multi-source context and redaction (Tasks 1–8 done)** → M2 evidence ranking and budgeting → categorization → **eval harness** → embeddings/vector DB → RAG → flaky detection → debugging agent → Slack → MCP server → multi-agent → production hardening.
+M0 walking skeleton (done) → **M1 structured outputs (done)** → **M2 multi-source context and safe artifact workflow (done)** → M3 categorization → **M4 eval harness** → embeddings/vector DB → RAG → flaky detection → debugging agent → Slack → MCP server → multi-agent → production hardening.
 
 The eval harness (M4) is the centerpiece: rigorous, testable evaluation of a non-deterministic system — the SDET-to-AI-engineer bridge.

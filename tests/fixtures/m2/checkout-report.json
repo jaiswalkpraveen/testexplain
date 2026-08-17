@@ -1,0 +1,64 @@
+{
+  "config": {
+    "projects": [
+      {
+        "name": "chromium"
+      }
+    ]
+  },
+  "errors": [],
+  "stats": {
+    "startTime": "2026-08-17T10:00:00.000Z"
+  },
+  "suites": [
+    {
+      "title": "checkout",
+      "file": "tests/checkout.spec.ts",
+      "specs": [
+        {
+          "title": "customer can place an order",
+          "id": "checkout-order-1",
+          "tests": [
+            {
+              "projectId": "chromium",
+              "projectName": "chromium",
+              "status": "unexpected",
+              "expectedStatus": "passed",
+              "results": [
+                {
+                  "retry": 0,
+                  "status": "timedOut",
+                  "duration": 30000,
+                  "startTime": "2026-08-17T10:00:00.000Z",
+                  "error": {
+                    "message": "Timeout 30000ms exceeded while waiting for checkout confirmation",
+                    "stack": "TimeoutError: Timeout 30000ms exceeded while waiting for checkout confirmation"
+                  },
+                  "stdout": [
+                    "opened checkout page",
+                    "submitted checkout order"
+                  ],
+                  "stderr": [
+                    "checkout confirmation did not arrive before the timeout"
+                  ],
+                  "attachments": [
+                    {
+                      "name": "checkout.trace.zip",
+                      "contentType": "application/zip",
+                      "path": "checkout.trace.zip"
+                    },
+                    {
+                      "name": "checkout.har",
+                      "contentType": "application/json",
+                      "path": "checkout.har"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
