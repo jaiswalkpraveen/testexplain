@@ -97,7 +97,7 @@ M2 Tasks 1–13 now provide:
 - safe report and bundle input handling with bounded artifact access
 - trace evidence for actions, console messages, page errors, stdout, stderr, and network events
 - HAR fallback evidence with bounded response-body previews
-- deterministic, idempotent redaction of authorization values, cookies, API keys, query secrets, JSON secret fields, and vendor-prefixed tokens
+- deterministic, idempotent redaction of authorization values, cookies, API keys, query secrets, JSON secret fields, and vendor-prefixed tokens in normalized evidence
 - pure redaction helpers that preserve evidence metadata while returning new objects
 - deterministic severity/temporal ranking, network deduplication, and a 4,000-token evidence budget
 - attempt-aware prompt orchestration with project, retry, flaky, provenance, and evidence-gap context
@@ -105,7 +105,7 @@ M2 Tasks 1–13 now provide:
 - multipart ZIP uploads through `POST /analyze-bundle`, with streaming size limits and temporary-file cleanup
 - synthetic production-shaped fixtures and prompt ablation tests proving report-only, trace, and trace-plus-HAR context
 
-The security boundary is deliberate: redaction happens before evidence is composed into a prompt. This matters because prompt content is sent to a third-party model, and the model may quote evidence in its response. Generic URL path segments and locator-shaped action arguments remain documented limitations because they cannot be distinguished reliably from ordinary diagnostic values without more context.
+The security boundary is deliberate: common secrets are redacted from normalized artifact evidence before that evidence is composed into a prompt. This matters because prompt content is sent to a third-party model, and the model may quote evidence in its response. Report metadata, error messages, and stack traces remain caller-supplied prompt fields and must be reviewed separately. Generic URL path segments and locator-shaped action arguments remain documented limitations because they cannot be distinguished reliably from ordinary diagnostic values without more context.
 
 The M2 workflow is documented in [Collecting Playwright Artifacts](docs/guides/collecting-artifacts.md). The guide covers native JSON reports, trace/HAR attachment paths, offline validation, ZIP bundling, API upload, and troubleshooting.
 

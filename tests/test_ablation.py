@@ -34,6 +34,8 @@ def test_report_only_prompt_has_report_evidence_but_no_artifact_evidence(tmp_pat
     prompt = _prompt(tmp_path)
 
     assert "Timeout 30000ms exceeded" in prompt
+    assert "submitted checkout order" in prompt
+    assert "checkout confirmation did not arrive" in prompt
     assert "[trace]" not in prompt
     assert "[har]" not in prompt
     assert "checkout.trace.zip" in prompt

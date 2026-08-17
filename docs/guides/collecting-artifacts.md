@@ -18,6 +18,7 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   reporter: [["json", { outputFile: "artifacts/playwright-report.json" }]],
+  outputDir: "artifacts/test-results",
   use: {
     trace: "retain-on-failure",
   },
@@ -45,14 +46,19 @@ import { test as base } from "@playwright/test";
 
 export const test = base.extend({
   context: async ({ browser }, use, testInfo) => {
+    const harPath = testInfo.outputPath("network.har");
     const context = await browser.newContext({
       recordHar: {
-        path: testInfo.outputPath("network.har"),
+        path: harPath,
         content: "embed",
       },
     });
     await use(context);
     await context.close();
+    await testInfo.attach("network.har", {
+      path: harPath,
+      contentType: "application/json",
+    });
   },
 });
 ```
@@ -106,7 +112,9 @@ they exist; bundle members must remain inside the ZIP extraction directory.
 ## Validate A Report Offline
 
 Run the fake gateway first. This parses the report, reads available attachments,
-redacts sensitive values, assembles a bounded prompt, and makes no network call:
+redacts common secrets in normalized artifact evidence, assembles a bounded
+prompt, and makes no network call. Review report error and stack fields too;
+they are prompt inputs and may contain sensitive text from the test runner:
 
 ```bash
 uv run testexplain analyze artifacts/playwright-report.json --fake
@@ -208,8 +216,9 @@ its uncompressed members exceed the reader's safety limits.
 ### Secrets or personal data in artifacts
 
 TestExplain performs deterministic redaction of common authorization headers,
-cookies, API keys, query values, and JSON secret fields before prompt
-composition. Redaction is a safety boundary, not permission to share raw
-production data. Review the report, trace, HAR, screenshots, and response
-bodies yourself and remove credentials, tokens, customer data, and internal
-URLs before uploading or committing them.
+cookies, API keys, query values, and JSON secret fields in normalized artifact
+evidence before prompt composition. Report metadata, error messages, stack
+traces, and other prompt fields may still contain sensitive text, so redaction
+is a safety aid rather than a guarantee. Review the report, trace, HAR,
+screenshots, and response bodies yourself and remove credentials, tokens,
+customer data, and internal URLs before uploading or committing them.
