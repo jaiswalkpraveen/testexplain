@@ -110,11 +110,13 @@ context.
 
 The repository and Python package are already named `testexplain`, and the
 GitHub remote already points to `jaiswalkpraveen/testexplain`. The remaining
-rename covers active code, user-facing documentation, historical project
-notes, LinkedIn drafts, temporary-file prefixes, and the local directory name
-`testlens` to `testexplain`. The local directory move will be performed only
-after repository changes are verified because moving the active working
-directory during development can interrupt the session.
+rename covers every project-controlled occurrence in active code, local-only
+project instructions, user-facing documentation, historical project notes,
+LinkedIn drafts, temporary-file prefixes, and the local directory name
+`testlens` to `testexplain`. Git history, dependency caches, and generated
+third-party files are not rewritten. The local directory move will be
+performed only after repository changes are verified because moving the active
+working directory during development can interrupt the session.
 
 ## Architecture and Data Flow
 
