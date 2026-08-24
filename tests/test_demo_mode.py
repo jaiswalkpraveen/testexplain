@@ -190,6 +190,41 @@ def test_post_analyze_byok_takes_precedence_over_demo(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"api_key": "byok-key"},
+        {"api_key": "byok-key", "base_url": "https://llm.example/v1"},
+        {"api_key": "byok-key", "model": "byok-model"},
+        {
+            "api_key": "byok-key",
+            "base_url": " ",
+            "model": "byok-model",
+        },
+        {"base_url": "https://llm.example/v1", "demo": True},
+        {"model": "byok-model", "demo": True},
+        {"api_key": "", "demo": True},
+        {
+            "api_key": "",
+            "base_url": "https://llm.example/v1",
+            "model": "byok-model",
+            "demo": True,
+        },
+    ],
+)
+def test_post_analyze_rejects_partial_byok_before_constructing_gateway(
+    monkeypatch, fields
+):
+    client = TestClient(app)
+    _set_demo_env(monkeypatch)
+    _forbid_real_gateway(monkeypatch)
+
+    response = client.post("/analyze", json={"report": REPORT_TEXT, **fields})
+
+    assert response.status_code == 422
+    assert "BYOK requires request-level" in response.json()["detail"]
+
+
 def test_post_analyze_fake_takes_precedence_over_byok_and_demo(monkeypatch):
     client = TestClient(app)
     _set_demo_env(monkeypatch)
@@ -348,6 +383,47 @@ def test_post_analyze_bundle_byok_takes_precedence_over_demo(tmp_path, monkeypat
     assert [(g.api_key, g.base_url, g.model) for g in gateways] == [
         ("byok-key", "https://llm.example/v1", "byok-model")
     ]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"api_key": "byok-key"},
+        {"api_key": "byok-key", "base_url": "https://llm.example/v1"},
+        {"api_key": "byok-key", "model": "byok-model"},
+        {
+            "api_key": "byok-key",
+            "base_url": "https://llm.example/v1",
+            "model": " ",
+        },
+        {"base_url": "https://llm.example/v1", "demo": "true"},
+        {"model": "byok-model", "demo": "true"},
+        {"api_key": "", "demo": "true"},
+        {
+            "api_key": "",
+            "base_url": "https://llm.example/v1",
+            "model": "byok-model",
+            "demo": "true",
+        },
+    ],
+)
+def test_post_analyze_bundle_rejects_partial_byok_before_constructing_gateway(
+    tmp_path, monkeypatch, fields
+):
+    client = TestClient(app)
+    bundle_path = _create_native_bundle(tmp_path)
+    _set_demo_env(monkeypatch)
+    _forbid_real_gateway(monkeypatch)
+
+    with bundle_path.open("rb") as bundle:
+        response = client.post(
+            "/analyze-bundle",
+            data=fields,
+            files={"bundle": ("bundle.zip", bundle, "application/zip")},
+        )
+
+    assert response.status_code == 422
+    assert "BYOK requires request-level" in response.json()["detail"]
 
 
 def test_post_analyze_bundle_fake_takes_precedence_over_byok_and_demo(

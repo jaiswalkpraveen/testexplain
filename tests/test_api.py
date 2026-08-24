@@ -2,6 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -96,6 +97,123 @@ def test_post_analyze_rejects_missing_api_key():
     assert "api_key is required" in response.json()["detail"]
 
 
+def test_post_analyze_rejects_oversized_content_length_before_writing_report(
+    monkeypatch,
+):
+    client = TestClient(app)
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("oversized reports must not reach the endpoint")
+
+    monkeypatch.setattr(api, "_write_tmp_report", must_not_run)
+    monkeypatch.setattr(api, "analyze_report", must_not_run)
+
+    response = client.post(
+        "/analyze",
+        content=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(api.MAX_REPORT_UPLOAD_BYTES + 1),
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Report upload exceeds 10 MiB limit."
+
+
+def test_post_analyze_rejects_chunked_oversized_report_before_writing_report(
+    monkeypatch,
+):
+    client = TestClient(app)
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("oversized reports must not reach the endpoint")
+
+    monkeypatch.setattr(api, "_write_tmp_report", must_not_run)
+    monkeypatch.setattr(api, "analyze_report", must_not_run)
+
+    def body_chunks():
+        yield b'{"report":"'
+        yield b"x" * (api.MAX_REPORT_UPLOAD_BYTES + 1)
+        yield b'", "fake": true}'
+
+    response = client.post(
+        "/analyze",
+        content=body_chunks(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Report upload exceeds 10 MiB limit."
+
+
+def test_get_analyze_with_oversized_content_length_preserves_validation_routing():
+    client = TestClient(app)
+
+    response = client.get(
+        "/analyze",
+        headers={"Content-Length": str(api.MAX_REPORT_UPLOAD_BYTES + 1)},
+    )
+
+    assert response.status_code == 422
+
+
+def test_write_tmp_report_deletes_file_if_writing_fails(tmp_path, monkeypatch):
+    created: list[Path] = []
+    real_mkstemp = api.tempfile.mkstemp
+
+    def mkstemp_in_tmp_path(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return fd, path
+
+    class FailingFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def write(self, content):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(api.tempfile, "mkstemp", mkstemp_in_tmp_path)
+    monkeypatch.setattr(api.os, "fdopen", lambda *args, **kwargs: FailingFile())
+
+    with pytest.raises(OSError, match="disk full"):
+        api._write_tmp_report("{}")
+
+    assert len(created) == 1
+    assert not created[0].exists()
+
+
+def test_write_tmp_report_closes_descriptor_and_deletes_file_if_fdopen_fails(
+    tmp_path, monkeypatch
+):
+    created: list[Path] = []
+    closed: list[int] = []
+    real_mkstemp = api.tempfile.mkstemp
+
+    def mkstemp_in_tmp_path(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return fd, path
+
+    def fdopen_fails(*args, **kwargs):
+        raise OSError("cannot open")
+
+    monkeypatch.setattr(api.tempfile, "mkstemp", mkstemp_in_tmp_path)
+    monkeypatch.setattr(api.os, "fdopen", fdopen_fails)
+    monkeypatch.setattr(api.os, "close", closed.append)
+
+    with pytest.raises(OSError, match="cannot open"):
+        api._write_tmp_report("{}")
+
+    assert len(created) == 1
+    assert closed
+    assert not created[0].exists()
+
+
 # ------------------------------------------------------------------
 # POST /analyze-bundle (multipart bundle upload)
 # ------------------------------------------------------------------
@@ -160,6 +278,10 @@ def test_post_analyze_bundle_rejects_upload_larger_than_50_mib(tmp_path, monkeyp
     assert response.status_code == 413
 
 
+def test_bundle_wire_limit_allows_multipart_framing_around_a_50_mib_file():
+    assert api.MAX_BUNDLE_REQUEST_BYTES > api.MAX_BUNDLE_UPLOAD_BYTES
+
+
 class _UnsizedUpload:
     """A read-only stream whose length httpx cannot peek.
 
@@ -207,7 +329,7 @@ def _capture_temp_uploads(monkeypatch, tmp_path) -> list[Path]:
     return created
 
 
-def test_post_analyze_bundle_rejects_chunked_upload_before_the_endpoint_runs(
+def test_post_analyze_bundle_rejects_chunked_upload_larger_than_50_mib_and_cleans_up(
     tmp_path, monkeypatch
 ):
     client = TestClient(app)
@@ -227,7 +349,8 @@ def test_post_analyze_bundle_rejects_chunked_upload_before_the_endpoint_runs(
         upload.close()
 
     assert response.status_code == 413
-    assert created == []
+    assert len(created) == 1
+    assert not created[0].exists()
 
 
 def test_post_analyze_bundle_deletes_temp_file_when_api_key_is_missing(
@@ -299,7 +422,11 @@ def test_post_analyze_bundle_propagates_invalid_llm_response_as_server_error(
     with bundle_path.open("rb") as bundle:
         response = client.post(
             "/analyze-bundle",
-            data={"api_key": "byok-key"},
+            data={
+                "api_key": "byok-key",
+                "base_url": "https://llm.example/v1",
+                "model": "test-model",
+            },
             files={"bundle": ("bundle.zip", bundle, "application/zip")},
         )
 
@@ -329,12 +456,41 @@ def test_post_analyze_bundle_deletes_temp_file_when_upload_close_fails(
     assert not created[0].exists()
 
 
-def test_post_analyze_bundle_rejects_oversized_content_length_before_the_endpoint_runs(
+def test_post_analyze_bundle_closes_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
+    client = TestClient(app, raise_server_exceptions=False)
+    bundle_path = _create_native_bundle(tmp_path)
+    created: list[Path] = []
+    closed: list[int] = []
+    real_mkstemp = api.tempfile.mkstemp
+
+    def mkstemp_in_tmp_path(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return fd, path
+
+    def fdopen_fails(*args, **kwargs):
+        raise OSError("cannot open")
+
+    monkeypatch.setattr(api.tempfile, "mkstemp", mkstemp_in_tmp_path)
+    monkeypatch.setattr(api.os, "fdopen", fdopen_fails)
+    monkeypatch.setattr(api.os, "close", closed.append)
+    with bundle_path.open("rb") as bundle:
+        response = client.post(
+            "/analyze-bundle",
+            data={"fake": "true"},
+            files={"bundle": ("bundle.zip", bundle, "application/zip")},
+        )
+
+    assert response.status_code == 500
+    assert len(created) == 1
+    assert closed
+    assert not created[0].exists()
+
+
+def test_post_analyze_bundle_rejects_file_larger_than_50_mib_and_cleans_up(
 tmp_path, monkeypatch
 ):
     client = TestClient(app)
-    # An empty list proves the handler never started: it always creates a temp
-    # ZIP as its first step.
     created = _capture_temp_uploads(monkeypatch, tmp_path)
     upload_path = tmp_path / "too-large.zip"
     with upload_path.open("wb") as upload:
@@ -348,7 +504,8 @@ tmp_path, monkeypatch
         )
 
     assert response.status_code == 413
-    assert created == []
+    assert len(created) == 1
+    assert not created[0].exists()
 
 
 def test_get_analyze_bundle_with_oversized_content_length_preserves_405_routing():

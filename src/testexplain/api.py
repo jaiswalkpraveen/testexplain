@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -32,38 +32,47 @@ load_dotenv()
 app = FastAPI(title="TestLens", description="Explain why your tests failed.")
 
 MAX_BUNDLE_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_REPORT_UPLOAD_BYTES = 10 * 1024 * 1024
+# Multipart boundaries and field headers sit outside the uploaded ZIP bytes.
+MAX_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+MAX_BUNDLE_REQUEST_BYTES = MAX_BUNDLE_UPLOAD_BYTES + MAX_MULTIPART_OVERHEAD_BYTES
 UPLOAD_CHUNK_BYTES = 1024 * 1024
-BUNDLE_UPLOAD_PATH = "/analyze-bundle"
+UPLOAD_LIMITS = {
+    "/analyze": (MAX_REPORT_UPLOAD_BYTES, "Report upload exceeds 10 MiB limit."),
+    "/analyze-bundle": (
+        MAX_BUNDLE_REQUEST_BYTES,
+        "Bundle upload exceeds 50 MiB limit.",
+    ),
+}
 # Demo mode spends the server's own quota, so it requires the full trio.
 DEMO_ENV_VARS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
 
 
-class _BundleUploadTooLarge(BaseException):
+class _UploadTooLarge(BaseException):
     """Internal control signal that bypasses FastAPI's exception handlers."""
 
 
-class BundleUploadSizeLimitMiddleware:
-    """Reject oversized bundle request bodies before multipart parsing."""
+class UploadSizeLimitMiddleware:
+    """Reject oversized public analysis bodies before FastAPI reads them."""
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if (
-            scope["type"] != "http"
-            or scope["method"] != "POST"
-            or scope["path"] != BUNDLE_UPLOAD_PATH
-        ):
+        if scope["type"] != "http" or scope["method"] != "POST":
             await self.app(scope, receive, send)
             return
 
+        limit = UPLOAD_LIMITS.get(scope["path"])
+        if limit is None:
+            await self.app(scope, receive, send)
+            return
+
+        max_bytes, detail = limit
         headers = dict(scope["headers"])
         declared_length = headers.get(b"content-length", b"").decode()
-        if declared_length.isdigit() and int(declared_length) > MAX_BUNDLE_UPLOAD_BYTES:
-            await JSONResponse(
-                status_code=413,
-                content={"detail": "Bundle upload exceeds 50 MiB limit."},
-            )(scope, receive, send)
+        if declared_length.isdigit() and int(declared_length) > max_bytes:
+            await JSONResponse(status_code=413, content={"detail": detail})(scope, receive, send)
             return
 
         received_bytes = 0
@@ -73,20 +82,17 @@ class BundleUploadSizeLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received_bytes += len(message.get("body", b""))
-                if received_bytes > MAX_BUNDLE_UPLOAD_BYTES:
-                    raise _BundleUploadTooLarge
+            if received_bytes > max_bytes:
+                raise _UploadTooLarge
             return message
 
         try:
             await self.app(scope, limited_receive, send)
-        except _BundleUploadTooLarge:
-            await JSONResponse(
-                status_code=413,
-                content={"detail": "Bundle upload exceeds 50 MiB limit."},
-            )(scope, receive, send)
+        except _UploadTooLarge:
+            await JSONResponse(status_code=413, content={"detail": detail})(scope, receive, send)
 
 
-app.add_middleware(BundleUploadSizeLimitMiddleware)
+app.add_middleware(UploadSizeLimitMiddleware)
 
 
 def _gateway_for_request(
@@ -96,6 +102,7 @@ def _gateway_for_request(
     model: str | None,
     fake: bool,
     demo: bool,
+    byok_supplied: bool | None = None,
 ):
     """Pick the gateway for one request.
 
@@ -104,7 +111,20 @@ def _gateway_for_request(
     """
     if fake:
         return FakeGateway()
-    if api_key:
+    byok_fields = {"api_key": api_key, "base_url": base_url, "model": model}
+    if byok_supplied is None:
+        byok_supplied = any(value is not None for value in byok_fields.values())
+    if byok_supplied:
+        missing = [
+            name
+            for name, value in byok_fields.items()
+            if not value or not value.strip()
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"BYOK requires request-level {', '.join(missing)}.",
+            )
         return OpenAICompatibleGateway(
             api_key=api_key,
             base_url=base_url,
@@ -205,9 +225,23 @@ def analyze_post(body: AnalyzeRequest) -> list[FailureAnalysis]:
 def _write_tmp_report(content: str) -> str:
     """Write report content to a temporary file and return its path."""
     fd, path = tempfile.mkstemp(suffix=".json", prefix="testlens-")
-    with os.fdopen(fd, "w") as f:
-        f.write(content)
-    return path
+    owns_fd = True
+    try:
+        with os.fdopen(fd, "w") as f:
+            owns_fd = False
+            f.write(content)
+        return path
+    except Exception:
+        if owns_fd:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # ------------------------------------------------------------------
@@ -217,6 +251,7 @@ def _write_tmp_report(content: str) -> str:
 
 @app.post("/analyze-bundle", response_model=list[FailureAnalysis])
 async def analyze_bundle(
+    request: Request,
     bundle: UploadFile = File(...),
     api_key: str | None = Form(default=None),
     base_url: str | None = Form(default=None),
@@ -226,24 +261,30 @@ async def analyze_bundle(
 ) -> list[FailureAnalysis]:
     """Analyze an uploaded failure-evidence ZIP bundle."""
     fd, path = tempfile.mkstemp(suffix=".zip", prefix="testlens-")
+    owns_fd = True
     try:
         uploaded_bytes = 0
         with os.fdopen(fd, "wb") as destination:
+            owns_fd = False
             while chunk := await bundle.read(UPLOAD_CHUNK_BYTES):
                 uploaded_bytes += len(chunk)
                 if uploaded_bytes > MAX_BUNDLE_UPLOAD_BYTES:
                     raise HTTPException(
                         status_code=413,
                         detail="Bundle upload exceeds 50 MiB limit.",
-                    )
+                )
                 destination.write(chunk)
 
+        form_data = await request.form()
         gateway = _gateway_for_request(
             api_key=api_key,
             base_url=base_url,
             model=model,
             fake=fake,
             demo=demo,
+            byok_supplied=any(
+                name in form_data for name in ("api_key", "base_url", "model")
+            ),
         )
 
         try:
@@ -256,6 +297,11 @@ async def analyze_bundle(
         try:
             await bundle.close()
         finally:
+            if owns_fd:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             Path(path).unlink(missing_ok=True)
 
 
