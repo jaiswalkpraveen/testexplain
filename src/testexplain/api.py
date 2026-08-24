@@ -87,6 +87,45 @@ class BundleUploadSizeLimitMiddleware:
 app.add_middleware(BundleUploadSizeLimitMiddleware)
 
 
+def _gateway_for_request(
+    *,
+    api_key: str | None,
+    base_url: str | None,
+    model: str | None,
+    fake: bool,
+    demo: bool,
+):
+    """Pick the gateway for one request.
+
+    Precedence: fake (offline) > caller's own key (BYOK) > demo (the
+    server's own LLM_* configuration) > refuse.
+    """
+    if fake:
+        return FakeGateway()
+    if api_key:
+        return OpenAICompatibleGateway(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+        )
+    if demo:
+        try:
+            return OpenAICompatibleGateway()
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Demo mode is not configured on this server (missing {exc}). "
+                    "Set LLM_API_KEY, LLM_BASE_URL and LLM_MODEL, "
+                    "or provide your own api_key."
+                ),
+            ) from exc
+    raise HTTPException(
+        status_code=422,
+        detail="api_key is required when fake is false.",
+    )
+
+
 # ------------------------------------------------------------------
 # Legacy GET endpoint — local file path, mostly for development
 # ------------------------------------------------------------------
@@ -122,6 +161,7 @@ class AnalyzeRequest(BaseModel):
     base_url: str | None = None
     model: str | None = None
     fake: bool = False
+    demo: bool = False
 
 
 @app.post("/analyze", response_model=list[FailureAnalysis])
@@ -141,19 +181,13 @@ def analyze_post(body: AnalyzeRequest) -> list[FailureAnalysis]:
             detail=f"Report is not valid JSON: {exc}",
         )
 
-    if body.fake:
-        gateway = FakeGateway()
-    else:
-        if not body.api_key:
-            raise HTTPException(
-                status_code=422,
-                detail="api_key is required when fake is false.",
-            )
-        gateway = OpenAICompatibleGateway(
-            api_key=body.api_key,
-            base_url=body.base_url,
-            model=body.model,
-        )
+    gateway = _gateway_for_request(
+        api_key=body.api_key,
+        base_url=body.base_url,
+        model=body.model,
+        fake=body.fake,
+        demo=body.demo,
+    )
 
     path = _write_tmp_report(body.report)
     try:
@@ -182,6 +216,7 @@ async def analyze_bundle(
     base_url: str | None = Form(default=None),
     model: str | None = Form(default=None),
     fake: bool = Form(default=False),
+    demo: bool = Form(default=False),
 ) -> list[FailureAnalysis]:
     """Analyze an uploaded failure-evidence ZIP bundle."""
     fd, path = tempfile.mkstemp(suffix=".zip", prefix="testlens-")
@@ -197,19 +232,13 @@ async def analyze_bundle(
                     )
                 destination.write(chunk)
 
-        if fake:
-            gateway = FakeGateway()
-        else:
-            if not api_key:
-                raise HTTPException(
-                    status_code=422,
-                    detail="api_key is required when fake is false.",
-                )
-            gateway = OpenAICompatibleGateway(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-            )
+        gateway = _gateway_for_request(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            fake=fake,
+            demo=demo,
+        )
 
         try:
             # analyze_report is synchronous; off-loading it keeps this async
