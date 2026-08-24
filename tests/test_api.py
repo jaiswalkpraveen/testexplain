@@ -16,6 +16,43 @@ FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
 REPORT_TEXT = FIXTURE.read_text()
 
 
+# ------------------------------------------------------------------
+# GET /samples/{sample_name} (packaged demo inputs)
+# ------------------------------------------------------------------
+
+
+def test_sample_report_returns_playwright_json():
+    client = TestClient(app)
+
+    response = client.get("/samples/checkout-report.json")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["suites"]
+
+
+def test_sample_bundle_returns_zip():
+    client = TestClient(app)
+
+    response = client.get("/samples/checkout-trace.zip")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/zip")
+
+
+def test_sample_route_rejects_unknown_names_and_path_traversal():
+    client = TestClient(app)
+
+    for sample_name in (
+        "not-a-sample.json",
+        # Relative to static/samples/ these resolve to real source files.
+        "..%2Findex.html",
+        "..%2F..%2Fapi.py",
+    ):
+        response = client.get(f"/samples/{sample_name}")
+        assert response.status_code == 404
+
+
 def test_analyze_endpoint_with_fake_gateway():
     client = TestClient(app)
 

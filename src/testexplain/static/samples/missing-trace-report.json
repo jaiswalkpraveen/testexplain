@@ -1,0 +1,42 @@
+{
+  "config": {},
+  "errors": [],
+  "stats": {},
+  "suites": [
+    {
+      "title": "checkout",
+      "file": "tests/checkout.spec.ts",
+      "specs": [
+        {
+          "title": "customer can place an order",
+          "id": "checkout-missing-trace",
+          "tests": [
+            {
+              "projectId": "chromium",
+              "projectName": "chromium",
+              "status": "unexpected",
+              "results": [
+                {
+                  "retry": 0,
+                  "status": "failed",
+                  "duration": 1000,
+                  "error": {
+                    "message": "checkout failed before confirmation",
+                    "stack": "Error: checkout failed before confirmation"
+                  },
+                  "attachments": [
+                    {
+                      "name": "missing.trace.zip",
+                      "contentType": "application/zip",
+                      "path": "missing.trace.zip"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

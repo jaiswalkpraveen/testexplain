@@ -18,7 +18,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
@@ -310,6 +310,22 @@ async def analyze_bundle(
 # ------------------------------------------------------------------
 
 _HERE = Path(__file__).parent
+_SAMPLES_DIR = _HERE / "static" / "samples"
+SAMPLE_FILES = {
+    "checkout-report.json": "checkout-report.json",
+    "checkout-trace.zip": "checkout-trace.zip",
+    "checkout-trace-har.zip": "checkout-trace-har.zip",
+    "missing-trace-report.json": "missing-trace-report.json",
+}
+
+
+@app.get("/samples/{sample_name}")
+def sample(sample_name: str) -> FileResponse:
+    """Serve one of the fixed demo inputs packaged with the application."""
+    filename = SAMPLE_FILES.get(sample_name)
+    if filename is None:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    return FileResponse(_SAMPLES_DIR / filename)
 
 
 @app.get("/", response_class=HTMLResponse)
