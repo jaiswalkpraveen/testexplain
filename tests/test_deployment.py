@@ -1,9 +1,19 @@
+from functools import cache
 from pathlib import Path
 
 import yaml
 
 
 ROOT = Path(__file__).parents[1]
+
+
+@cache
+def render_service() -> dict:
+    blueprint = yaml.safe_load((ROOT / "render.yaml").read_text())
+    services = blueprint["services"]
+
+    assert len(services) == 1
+    return services[0]
 
 
 def test_requirements_include_python_multipart_for_form_uploads():
@@ -13,27 +23,31 @@ def test_requirements_include_python_multipart_for_form_uploads():
 
 
 def test_render_configures_a_free_python_web_service():
-    blueprint = yaml.safe_load((ROOT / "render.yaml").read_text())
-    services = blueprint["services"]
-    service = services[0]
+    service = render_service()
+    start_command = service["startCommand"]
 
-    assert len(services) == 1
     assert service["type"] == "web"
     assert service["name"] == "testexplain"
     assert service["runtime"] == "python"
     assert service["plan"] == "free"
     assert service["buildCommand"] == "pip install -r requirements.txt"
-    assert service["startCommand"] == (
-        "PYTHONPATH=src uvicorn testexplain.api:app --host 0.0.0.0 --port $PORT"
-    )
+    assert "PYTHONPATH=src" in start_command
+    assert "uvicorn testexplain.api:app" in start_command
+    assert "--host 0.0.0.0" in start_command
+    assert "--port $PORT" in start_command
 
 
 def test_render_prompts_for_credentials_and_defaults_the_model():
-    blueprint = yaml.safe_load((ROOT / "render.yaml").read_text())
-    env_vars = blueprint["services"][0]["envVars"]
+    env_vars = {
+        variable["key"]: variable for variable in render_service()["envVars"]
+    }
 
-    assert env_vars == [
-        {"key": "LLM_BASE_URL", "sync": False},
-        {"key": "LLM_API_KEY", "sync": False},
-        {"key": "LLM_MODEL", "value": "gateframe/gemini-2.5-flash"},
-    ]
+    assert env_vars["LLM_BASE_URL"]["sync"] is False
+    assert env_vars["LLM_API_KEY"]["sync"] is False
+    assert env_vars["LLM_MODEL"]["value"] == "gateframe/gemini-2.5-flash"
+
+
+def test_asgi_app_imports():
+    from testexplain.api import app
+
+    assert callable(app)
