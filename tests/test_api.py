@@ -725,3 +725,29 @@ def test_index_blocks_submit_while_selected_json_file_is_still_loading():
     assert "pendingJsonRead = true;" in response.text
     assert "reader.onloadend" in response.text
     assert "Wait for the JSON file to finish loading." in response.text
+
+
+def test_index_offers_m2_sample_actions_and_safe_provider_controls():
+    html = TestClient(app).get("/").text
+
+    for label in (
+        "Report only",
+        "Report + trace",
+        "Report + trace + HAR",
+        "Missing trace",
+    ):
+        assert label in html
+    for path in (
+        "/samples/checkout-report.json",
+        "/samples/checkout-trace.zip",
+        "/samples/checkout-trace-har.zip",
+        "/samples/missing-trace-report.json",
+    ):
+        assert path in html
+    # Samples run on the server-funded, rate-limited demo key.
+    assert 'demo: true' in html or '"demo", "true"' in html
+    # BYOK is a named-provider choice; no free-form base URL input remains.
+    for provider in ("openai", "anthropic", "openrouter"):
+        assert f'value="{provider}"' in html
+    assert 'id="baseUrl"' not in html
+    assert "base_url" not in html.split("<script>")[0]

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TestLens — AI failure analysis</title>
+    <title>testExplain — AI failure analysis</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   body {
@@ -80,32 +80,62 @@
     border: 2px solid rgba(255,255,255,.3); border-top-color: #fff;
     border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle;
   }
-  .or-divider { text-align: center; color: #9ca3af; font-size: .8rem; margin: .5rem 0; }
+.or-divider { text-align: center; color: #9ca3af; font-size: .8rem; margin: .5rem 0; }
+
+select { padding: .5rem .65rem; border: 1px solid #d0d5dd; border-radius: 6px; font-size: .9rem; font-family: inherit; background: #fff; width: 100%; }
+.sample-row { display: flex; flex-wrap: wrap; gap: .5rem; }
+.sample-btn {
+  flex: 1 1 45%; padding: .6rem .5rem; border: 1px solid #6366f1; border-radius: 6px;
+  background: #fff; color: #4338ca; font-size: .85rem; font-weight: 600; cursor: pointer;
+}
+.sample-btn:hover { background: #eef2ff; }
+.sample-btn:disabled { opacity: .5; cursor: not-allowed; }
+.sample-note { font-size: .78rem; color: #6b7280; margin-top: .5rem; }
+.demo-note { font-size: .78rem; color: #92400e; background: #fef3c7; border-radius: 6px; padding: .5rem .75rem; margin-top: .5rem; }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>TestLens</h1>
-  <p class="subtitle">Upload a Playwright JSON report and get AI-powered failure analysis. Bring your own LLM API key.</p>
+    <h1>testExplain</h1>
+    <p class="subtitle">Upload a Playwright JSON report or failure bundle and get AI-powered failure analysis.</p>
+
+    <div class="card">
+      <h2>Try a sample — same failure, more evidence</h2>
+      <p class="sample-note">Each button analyzes the same checkout failure with a different evidence bundle. Compare how the explanation changes as trace and HAR evidence is added.</p>
+      <div class="sample-row">
+        <button type="button" class="sample-btn" data-sample="/samples/checkout-report.json" data-kind="report" data-label="Report only">Report only</button>
+        <button type="button" class="sample-btn" data-sample="/samples/checkout-trace.zip" data-kind="bundle" data-label="Report + trace">Report + trace</button>
+        <button type="button" class="sample-btn" data-sample="/samples/checkout-trace-har.zip" data-kind="bundle" data-label="Report + trace + HAR">Report + trace + HAR</button>
+        <button type="button" class="sample-btn" data-sample="/samples/missing-trace-report.json" data-kind="report" data-label="Missing trace">Missing trace</button>
+      </div>
+      <div class="demo-note">Samples use the server demo key — limited to 10 analyses per hour per visitor.</div>
+    </div>
 
   <form id="analyzeForm">
-    <div class="card">
-      <h2>LLM configuration</h2>
-      <div class="form-row">
-        <div>
-          <label for="apiKey">API key</label>
-          <input type="password" id="apiKey" placeholder="sk-... or gf_...">
+      <div class="card">
+        <h2>LLM configuration</h2>
+        <div class="form-row">
+          <div>
+            <label for="provider">Provider</label>
+            <select id="provider">
+              <option value="demo" selected>Demo (server key)</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+          </div>
+          <div>
+            <label for="model">Model</label>
+            <input type="text" id="model" value="gateframe/gemini-2.5-flash">
+          </div>
         </div>
-        <div>
-          <label for="model">Model</label>
-          <input type="text" id="model" value="gateframe/gemini-2.5-flash">
+        <div class="form-row">
+          <div>
+            <label for="apiKey">API key</label>
+            <input type="password" id="apiKey" placeholder="sk-... or gf_...">
+          </div>
         </div>
       </div>
-      <div>
-        <label for="baseUrl">Base URL</label>
-        <input type="text" id="baseUrl" value="https://router.gateframe.ai/v1">
-      </div>
-    </div>
 
 <div class="card">
 <h2>Playwright report</h2>
@@ -144,6 +174,9 @@ const zipName = document.getElementById("zipName");
 const errorDiv = document.getElementById("error");
 const resultsDiv = document.getElementById("results");
 const submitBtn = document.getElementById("submitBtn");
+const providerSelect = document.getElementById("provider");
+const apiKeyInput = document.getElementById("apiKey");
+const modelInput = document.getElementById("model");
 
 let selectedZip = null;
 let pendingJsonRead = false;
@@ -232,61 +265,33 @@ submitBtn.disabled = true;
 try {
 let res;
 if (selectedZip) {
- if (selectedZip.size > MAX_BUNDLE_BYTES) {
- throw new Error("Bundle ZIP exceeds the 50 MiB upload limit.");
- }
-const formData = new FormData();
-formData.append("bundle", selectedZip);
-const apiKey = document.getElementById("apiKey").value;
-const baseUrl = document.getElementById("baseUrl").value;
-const model = document.getElementById("model").value;
- if (apiKey) formData.append("api_key", apiKey);
- if (baseUrl) formData.append("base_url", baseUrl);
- if (model) formData.append("model", model);
- // No manual Content-Type: the browser sets the multipart boundary.
- res = await fetch("/analyze-bundle", { method: "POST", body: formData });
+      if (selectedZip.size > MAX_BUNDLE_BYTES) {
+        throw new Error("Bundle ZIP exceeds the 50 MiB upload limit.");
+      }
+      const formData = new FormData();
+      formData.append("bundle", selectedZip);
+      const config = llmConfig();
+      for (const [name, value] of Object.entries(config)) {
+        if (value === true) formData.append(name, "true");
+        else if (value) formData.append(name, value);
+      }
+      // No manual Content-Type: the browser sets the multipart boundary.
+      res = await fetch("/analyze-bundle", { method: "POST", body: formData });
  } else {
 const report = reportText.value;
 if (!report.trim()) { throw new Error("Paste or upload a Playwright JSON report, or choose a bundle ZIP."); }
 
- res = await fetch("/analyze", {
-method: "POST",
-headers: { "Content-Type": "application/json" },
-body: JSON.stringify({
-report,
-api_key: document.getElementById("apiKey").value || null,
-base_url: document.getElementById("baseUrl").value || null,
-model: document.getElementById("model").value || null,
-}),
-});
-}
+      res = await fetch("/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          report,
+          ...llmConfig(),
+        }),
+      });
+    }
 
-if (!res.ok) {
- throw new Error(await responseError(res));
-}
-
-const data = await res.json();
- if (!Array.isArray(data)) { throw new Error(`Unexpected response from server (${res.status}).`); }
-if (!data.length) {
-resultsDiv.innerHTML = '<div class="card">No failed tests found. All tests passed!</div>';
-return;
-}
-
- resultsDiv.innerHTML = data.map((a) => {
-const cat = a.suspected_category.replace(/\s+/g, "-");
-const conf = (a.confidence * 100).toFixed(0);
- return `
-<div class="result-card">
-<h3>${esc(a.test_title)}</h3>
-<div class="meta">
-<span class="badge badge-${cat}">${esc(a.suspected_category)}</span>
-<span class="confidence">${conf}% confidence</span>
-</div>
-<div class="summary">${esc(a.summary)}</div>
-${listBlock("Evidence", a.evidence)}
-${listBlock("Next steps", a.next_steps)}
-</div>`;
- }).join("");
+    await renderResponse(res);
 } catch (err) {
     errorDiv.textContent = err.message;
  } finally {
@@ -299,6 +304,100 @@ function esc(s) { const d = document.createElement("div"); d.textContent = s; re
 function listBlock(label, items) {
   if (!items || !items.length) return "";
   return `<div class="list-label">${label}</div><ul>${items.map(i => `<li>${esc(i)}</li>`).join("")}</ul>`;
+}
+
+// Provider config: "demo" uses the server's rate-limited key; other values are
+// named providers mapped to fixed trusted endpoints by the server.
+function llmConfig() {
+  const provider = providerSelect.value;
+  if (provider === "demo") return { demo: true };
+  return {
+    provider,
+    api_key: apiKeyInput.value || null,
+    model: modelInput.value || null,
+  };
+}
+
+providerSelect.addEventListener("change", () => {
+  const demo = providerSelect.value === "demo";
+  apiKeyInput.disabled = demo;
+  modelInput.disabled = demo;
+  apiKeyInput.required = !demo;
+  if (!demo && !apiKeyInput.value) errorDiv.textContent = "";
+});
+// Initial state: the demo provider needs no key or model input.
+apiKeyInput.disabled = true;
+modelInput.disabled = true;
+
+// Sample buttons: fetch a packaged M2 fixture and submit it through the same
+// endpoints as manual uploads, always using the server demo key.
+async function runSample(btn) {
+  const path = btn.dataset.sample;
+  const kind = btn.dataset.kind;
+  const label = btn.dataset.label;
+  errorDiv.textContent = "";
+  resultsDiv.innerHTML = "";
+  setSamplesDisabled(true);
+  btn.textContent = `Running ${label}...`;
+  try {
+    let res;
+    if (kind === "report") {
+      const report = await fetch(path).then((r) => r.text());
+      res = await fetch("/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ report, demo: true }),
+      });
+    } else {
+      const blob = await fetch(path).then((r) => r.blob());
+      const formData = new FormData();
+      formData.append("bundle", blob, path.split("/").pop());
+      formData.append("demo", "true");
+      res = await fetch("/analyze-bundle", { method: "POST", body: formData });
+    }
+    await renderResponse(res, label);
+  } catch (err) {
+    errorDiv.textContent = err.message;
+  } finally {
+    setSamplesDisabled(false);
+    btn.textContent = label;
+  }
+}
+
+function setSamplesDisabled(disabled) {
+  document.querySelectorAll(".sample-btn").forEach((b) => (b.disabled = disabled));
+}
+
+document.querySelectorAll(".sample-btn").forEach((btn) => {
+  btn.addEventListener("click", () => runSample(btn));
+});
+
+async function renderResponse(res, label) {
+  if (!res.ok) {
+    const detail = await responseError(res);
+    throw new Error(res.status === 429 ? `${label}: ${detail}` : detail);
+  }
+  const data = await res.json();
+  if (!Array.isArray(data)) { throw new Error(`Unexpected response from server (${res.status}).`); }
+  if (!data.length) {
+    resultsDiv.innerHTML = `<div class="card">${label ? esc(label) + ": " : ""}No failed tests found. All tests passed!</div>`;
+    return;
+  }
+  resultsDiv.innerHTML = (label ? `<div class="card"><strong>${esc(label)}</strong></div>` : "") + data.map((a) => {
+    const cat = a.suspected_category.replace(/\s+/g, "-");
+    const conf = (a.confidence * 100).toFixed(0);
+    return `
+      <div class="result-card">
+        <h3>${esc(a.test_title)}</h3>
+        <div class="meta">
+          <span class="badge badge-${cat}">${esc(a.suspected_category)}</span>
+          <span class="confidence">${conf}% confidence</span>
+        </div>
+        <div class="summary">${esc(a.summary)}</div>
+        ${listBlock("Evidence", a.evidence)}
+        ${listBlock("Next steps", a.next_steps)}
+      </div>`;
+  }).join("");
 }
 </script>
 </body>
