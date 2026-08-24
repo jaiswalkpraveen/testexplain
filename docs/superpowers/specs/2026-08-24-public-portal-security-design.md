@@ -36,9 +36,23 @@ free Render instance restarts, which is accepted for this short-lived feedback
 portal. The limit is applied before analysis begins and returns HTTP 429
 without calling the gateway or analysis pipeline.
 
+This limit is process-local. A multi-worker or horizontally scaled deployment
+can give the same client a separate budget per process. The chosen Render demo
+uses one Uvicorn process, and this limitation is accepted alongside the
+provider spending cap. A production service would replace the dictionary with
+an atomic shared store such as Redis.
+
 The rate limiter is not authentication or durable billing protection. Render
 environment variables, a low-cost demo model, and a provider spending cap
 remain required operational controls.
+
+`TRUSTED_PROXY_IPS` is a comma-separated deployment setting for the immediate
+Render ingress peer addresses. Only when `request.client.host` matches this
+setting does the quota use the first `X-Forwarded-For` address. With the
+setting absent or incorrect, the quota deliberately uses the direct peer
+instead of trusting a caller-supplied header; this can make colleagues share a
+bucket, but cannot be bypassed by spoofing headers. Set the value from the
+Render service's observed ingress topology before enabling the server demo key.
 
 ## Public Route Boundary
 

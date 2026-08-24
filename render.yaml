@@ -12,3 +12,5 @@ services:
         sync: false
       - key: LLM_MODEL
         value: gateframe/gemini-2.5-flash
+      - key: TRUSTED_PROXY_IPS
+        sync: false

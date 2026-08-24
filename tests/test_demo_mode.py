@@ -11,8 +11,11 @@ is always intercepted (patched ``analyze_report`` or a FakeGateway).
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+import zipfile
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import testexplain.api as api
@@ -21,7 +24,9 @@ from testexplain.gateway import AnthropicGateway, FakeGateway, OpenAICompatibleG
 from testexplain.ingestion.package import create_bundle
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
-REPORT_TEXT = FIXTURE.read_text()
+REPORT = json.loads(FIXTURE.read_text())
+REPORT.update(config={}, errors=[], stats={})
+REPORT_TEXT = json.dumps(REPORT)
 
 DEMO_ENV = {
     "LLM_API_KEY": "demo-server-key",
@@ -42,14 +47,15 @@ def _clear_demo_env(monkeypatch):
 
 
 def _capture_gateway(monkeypatch) -> list:
-    """Patch analyze_report to record the gateway and skip the LLM call."""
+    """Record gateways while bypassing both report and preloaded-input analysis."""
     captured: list = []
 
-    def fake_analyze_report(path, gateway):
+    def fake_analysis(input_value, gateway):
         captured.append(gateway)
         return []
 
-    monkeypatch.setattr(api, "analyze_report", fake_analyze_report)
+    monkeypatch.setattr(api, "analyze_report", fake_analysis)
+    monkeypatch.setattr(api, "analyze_loaded_input", fake_analysis)
     return captured
 
 
@@ -94,6 +100,18 @@ def _set_demo_env_without(monkeypatch, var: str, blank_value: str | None):
         monkeypatch.setenv(var, blank_value)
 
 
+def _request_from_ip(ip: str, forwarded_for: str | None = None):
+    headers = {} if forwarded_for is None else {"x-forwarded-for": forwarded_for}
+    return SimpleNamespace(client=SimpleNamespace(host=ip), headers=headers)
+
+
+@pytest.fixture(autouse=True)
+def reset_demo_quota():
+    api._reset_demo_quota_for_tests()
+    yield
+    api._reset_demo_quota_for_tests()
+
+
 def _assert_demo_not_configured(detail: str):
     assert "demo mode is not configured" in detail.lower()
     for var in DEMO_ENV:
@@ -107,6 +125,13 @@ def _create_native_bundle(tmp_path: Path) -> Path:
     report_path = tmp_path / "report.json"
     report_path.write_text(json.dumps(report))
     return create_bundle(report_path, tmp_path / "bundle.zip").output_path
+
+
+def _create_non_native_bundle(tmp_path: Path) -> Path:
+    bundle_path = tmp_path / "not-a-playwright-bundle.zip"
+    with zipfile.ZipFile(bundle_path, "w") as archive:
+        archive.writestr("not-a-report.json", '{"not": "a report"}')
+    return bundle_path
 
 
 def _capture_temp_uploads(monkeypatch, tmp_path) -> list[Path]:
@@ -142,6 +167,202 @@ def test_post_analyze_demo_uses_server_env_vars(monkeypatch):
     assert gateway.model == "demo-model"
     assert str(gateway.client.base_url).startswith("http://127.0.0.1:9/v1")
     assert gateway.client.api_key == "demo-server-key"
+
+
+def test_post_analyze_demo_allows_ten_requests_then_rejects_before_analysis(
+    monkeypatch,
+):
+    client = TestClient(app)
+    _set_demo_env(monkeypatch)
+    captured = _capture_gateway(monkeypatch)
+
+    for _ in range(api.DEMO_REQUESTS_PER_HOUR):
+        response = client.post("/analyze", json={"report": REPORT_TEXT, "demo": True})
+        assert response.status_code == 200
+
+    response = client.post("/analyze", json={"report": REPORT_TEXT, "demo": True})
+
+    assert response.status_code == 429
+    assert "Demo request limit reached" in response.json()["detail"]
+    assert len(captured) == api.DEMO_REQUESTS_PER_HOUR
+
+
+def test_post_analyze_demo_quota_rejects_before_constructing_gateway(monkeypatch):
+    client = TestClient(app)
+    _set_demo_env(monkeypatch)
+
+    for _ in range(api.DEMO_REQUESTS_PER_HOUR):
+        api._consume_demo_quota(_request_from_ip("testclient"))
+
+    _forbid_real_gateway(monkeypatch)
+    _forbid_analysis(monkeypatch)
+    response = client.post("/analyze", json={"report": REPORT_TEXT, "demo": True})
+
+    assert response.status_code == 429
+
+
+def test_demo_quota_uses_separate_client_ip_buckets(monkeypatch):
+    _set_demo_env(monkeypatch)
+    captured = _capture_gateway(monkeypatch)
+
+    for _ in range(api.DEMO_REQUESTS_PER_HOUR):
+        api._consume_demo_quota(_request_from_ip("198.51.100.10"))
+
+    api._consume_demo_quota(_request_from_ip("198.51.100.11"))
+
+    assert captured == []
+
+
+def test_demo_quota_resets_after_one_hour(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(api.time, "monotonic", lambda: now[0])
+
+    for _ in range(api.DEMO_REQUESTS_PER_HOUR):
+        api._consume_demo_quota(_request_from_ip("198.51.100.10"))
+
+    now[0] += api.DEMO_WINDOW_SECONDS
+    api._consume_demo_quota(_request_from_ip("198.51.100.10"))
+
+
+def test_demo_quota_prunes_expired_ips_when_another_client_arrives(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(api.time, "monotonic", lambda: now[0])
+    api._consume_demo_quota(_request_from_ip("198.51.100.10"))
+
+    now[0] += api.DEMO_WINDOW_SECONDS
+    api._consume_demo_quota(_request_from_ip("198.51.100.11"))
+
+    assert set(api._demo_quota) == {"198.51.100.11"}
+
+
+def test_demo_quota_ignores_forwarded_header_from_untrusted_peer(monkeypatch):
+    monkeypatch.delenv("TRUSTED_PROXY_IPS", raising=False)
+
+    for spoofed in range(api.DEMO_REQUESTS_PER_HOUR):
+        api._consume_demo_quota(
+            _request_from_ip("203.0.113.5", forwarded_for=f"198.51.100.{spoofed}")
+        )
+
+    with pytest.raises(HTTPException) as rejected:
+        api._consume_demo_quota(
+            _request_from_ip("203.0.113.5", forwarded_for="198.51.100.99")
+        )
+
+    assert rejected.value.status_code == 429
+    assert set(api._demo_quota) == {"203.0.113.5"}
+
+
+def test_demo_quota_uses_forwarded_client_from_trusted_proxy(monkeypatch):
+    monkeypatch.setenv("TRUSTED_PROXY_IPS", "10.0.0.7")
+
+    for _ in range(api.DEMO_REQUESTS_PER_HOUR):
+        api._consume_demo_quota(
+            _request_from_ip("10.0.0.7", forwarded_for="198.51.100.10, 10.0.0.7")
+        )
+
+    api._consume_demo_quota(
+        _request_from_ip("10.0.0.7", forwarded_for="198.51.100.11")
+    )
+
+    assert set(api._demo_quota) == {"198.51.100.10", "198.51.100.11"}
+
+
+def test_demo_quota_rejects_new_identity_when_bucket_capacity_is_reached(monkeypatch):
+    monkeypatch.setattr(api, "MAX_DEMO_QUOTA_BUCKETS", 2)
+    first = _request_from_ip("198.51.100.10")
+    api._consume_demo_quota(first)
+    api._consume_demo_quota(_request_from_ip("198.51.100.11"))
+    api._consume_demo_quota(first)
+
+    with pytest.raises(HTTPException) as rejected:
+        api._consume_demo_quota(_request_from_ip("198.51.100.12"))
+
+    assert rejected.value.status_code == 429
+    assert set(api._demo_quota) == {"198.51.100.10", "198.51.100.11"}
+
+
+def test_post_analyze_bundle_demo_quota_rejects_before_gateway_and_analysis(
+    tmp_path, monkeypatch
+):
+    client = TestClient(app)
+    bundle_path = _create_native_bundle(tmp_path)
+    _set_demo_env(monkeypatch)
+
+    for _ in range(api.DEMO_REQUESTS_PER_HOUR):
+        api._consume_demo_quota(_request_from_ip("testclient"))
+
+    _forbid_real_gateway(monkeypatch)
+    _forbid_analysis(monkeypatch)
+    with bundle_path.open("rb") as bundle:
+        response = client.post(
+            "/analyze-bundle",
+            data={"demo": "true"},
+            files={"bundle": ("bundle.zip", bundle, "application/zip")},
+        )
+
+    assert response.status_code == 429
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"demo": "true"},
+        {
+            "provider": "openai",
+            "api_key": "byok-key",
+            "model": "test-model",
+        },
+    ],
+)
+def test_non_native_bundle_is_rejected_before_quota_or_gateway(
+    tmp_path, monkeypatch, fields
+):
+    client = TestClient(app)
+    bundle_path = _create_non_native_bundle(tmp_path)
+    _set_demo_env(monkeypatch)
+    _forbid_real_gateway(monkeypatch)
+    _forbid_analysis(monkeypatch)
+
+    with bundle_path.open("rb") as bundle:
+        response = client.post(
+            "/analyze-bundle",
+            data=fields,
+            files={"bundle": ("bundle.zip", bundle, "application/zip")},
+        )
+
+    assert response.status_code == 422
+    assert api._demo_quota == {}
+
+
+def test_fake_and_byok_requests_do_not_consume_demo_quota(monkeypatch):
+    client = TestClient(app)
+    _set_demo_env(monkeypatch)
+    captured = _capture_gateway(monkeypatch)
+
+    response = client.post(
+        "/analyze",
+        json={"report": REPORT_TEXT, "fake": True, "demo": True},
+    )
+    assert response.status_code == 200
+
+    class CapturingGateway(FakeGateway):
+        def __init__(self, **kwargs):
+            super().__init__()
+            captured.append(self)
+
+    monkeypatch.setattr(api, "OpenAICompatibleGateway", CapturingGateway)
+    response = client.post(
+        "/analyze",
+        json={
+            "report": REPORT_TEXT,
+            "demo": True,
+            "provider": "openai",
+            "api_key": "byok-key",
+            "model": "test-model",
+        },
+    )
+    assert response.status_code == 200
+    assert api._demo_quota == {}
 
 
 def test_post_analyze_demo_without_server_config_returns_422(monkeypatch):

@@ -1,6 +1,8 @@
 import asyncio
+import io
 import json
 from pathlib import Path
+import zipfile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,7 +15,9 @@ from testexplain.gateway import FakeGateway
 from testexplain.ingestion.package import create_bundle
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
-REPORT_TEXT = FIXTURE.read_text()
+REPORT = json.loads(FIXTURE.read_text())
+REPORT.update(config={}, errors=[], stats={})
+REPORT_TEXT = json.dumps(REPORT)
 
 
 # ------------------------------------------------------------------
@@ -40,6 +44,45 @@ def test_sample_bundle_returns_zip():
     assert response.headers["content-type"].startswith("application/zip")
 
 
+@pytest.mark.parametrize(
+    "sample_name",
+    sorted(
+        (
+            "checkout-report.json",
+            "checkout-trace.zip",
+            "checkout-trace-har.zip",
+            "missing-trace-report.json",
+        )
+    ),
+)
+def test_every_packaged_sample_is_served(sample_name):
+    response = TestClient(app).get(f"/samples/{sample_name}")
+
+    assert response.status_code == 200
+
+
+def test_trace_only_sample_contains_no_har():
+    response = TestClient(app).get("/samples/checkout-trace.zip")
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        members = archive.namelist()
+
+    assert "report.json" in members
+    assert any(member.endswith("checkout.trace.zip") for member in members)
+    assert not any(member.endswith("checkout.har") for member in members)
+
+
+def test_trace_har_sample_contains_both_artifacts():
+    response = TestClient(app).get("/samples/checkout-trace-har.zip")
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        members = archive.namelist()
+
+    assert "report.json" in members
+    assert any(member.endswith("checkout.trace.zip") for member in members)
+    assert any(member.endswith("checkout.har") for member in members)
+
+
 def test_sample_route_rejects_unknown_names_and_path_traversal():
     client = TestClient(app)
 
@@ -53,8 +96,9 @@ def test_sample_route_rejects_unknown_names_and_path_traversal():
         assert response.status_code == 404
 
 
-def test_analyze_endpoint_with_fake_gateway():
+def test_analyze_endpoint_with_fake_gateway(monkeypatch):
     client = TestClient(app)
+    monkeypatch.setenv("TESTEXPLAIN_ENABLE_LOCAL_PATH_API", "true")
 
     # Using the sample fixture fixture.
     response = client.get(
@@ -75,8 +119,35 @@ def test_analyze_endpoint_with_fake_gateway():
     assert 0.0 <= data[0]["confidence"] <= 1.0
 
 
-def test_analyze_endpoint_returns_error_for_missing_file():
+def test_local_path_analyze_endpoint_is_disabled_by_default(monkeypatch):
     client = TestClient(app)
+    monkeypatch.delenv("TESTEXPLAIN_ENABLE_LOCAL_PATH_API", raising=False)
+
+    response = client.get(
+        "/analyze",
+        params={"report_path": "missing-private-report.json", "fake": "true"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Not found"
+    assert "missing-private-report.json" not in response.text
+
+
+def test_local_path_analyze_endpoint_requires_explicit_development_opt_in(monkeypatch):
+    client = TestClient(app)
+    monkeypatch.setenv("TESTEXPLAIN_ENABLE_LOCAL_PATH_API", "true")
+
+    response = client.get(
+        "/analyze",
+        params={"report_path": str(FIXTURE), "fake": "true"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_analyze_endpoint_returns_error_for_missing_file(monkeypatch):
+    client = TestClient(app)
+    monkeypatch.setenv("TESTEXPLAIN_ENABLE_LOCAL_PATH_API", "true")
 
     response = client.get(
         "/analyze",
@@ -120,6 +191,18 @@ def test_post_analyze_rejects_invalid_json():
 
     assert response.status_code == 422
     assert "not valid JSON" in response.json()["detail"]
+
+
+def test_post_analyze_rejects_valid_json_that_is_not_a_playwright_report(monkeypatch):
+    monkeypatch.setattr(api, "analyze_report", lambda *args: (_ for _ in ()).throw(AssertionError()))
+
+    response = TestClient(app).post(
+        "/analyze",
+        json={"report": json.dumps({"suites": []}), "fake": True},
+    )
+
+    assert response.status_code == 422
+    assert "report" in response.json()["detail"].lower()
 
 
 def test_post_analyze_rejects_missing_api_key():
@@ -559,19 +642,19 @@ def test_get_analyze_bundle_with_oversized_content_length_preserves_405_routing(
 def test_post_analyze_bundle_runs_analysis_off_the_event_loop(tmp_path, monkeypatch):
     client = TestClient(app)
     bundle_path = _create_native_bundle(tmp_path)
-    real_analyze_report = api.analyze_report
+    real_analyze_loaded_input = api.analyze_loaded_input
     on_event_loop: list[bool] = []
 
-    def record_calling_context(path, gateway):
+    def record_calling_context(loaded, gateway):
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             on_event_loop.append(False)
         else:
             on_event_loop.append(True)
-        return real_analyze_report(path, gateway)
+        return real_analyze_loaded_input(loaded, gateway)
 
-    monkeypatch.setattr(api, "analyze_report", record_calling_context)
+    monkeypatch.setattr(api, "analyze_loaded_input", record_calling_context)
     with bundle_path.open("rb") as bundle:
         response = client.post(
             "/analyze-bundle",

@@ -99,6 +99,33 @@ def test_load_input_marks_invalid_bundle_errors_with_a_specific_exception(tmp_pa
         load_input(bundle)
 
 
+def test_load_input_cleans_partial_extraction_after_multiple_reports(tmp_path, monkeypatch):
+    created_dirs: list[Path] = []
+    real_temporary_directory = input_reader.tempfile.TemporaryDirectory
+
+    def capture_temporary_directory(*args, **kwargs):
+        directory = real_temporary_directory(*args, **kwargs)
+        created_dirs.append(Path(directory.name))
+        return directory
+
+    monkeypatch.setattr(
+        input_reader.tempfile, "TemporaryDirectory", capture_temporary_directory
+    )
+    bundle = write_bundle(
+        tmp_path / "results.zip",
+        {
+            "first.json": json.dumps(playwright_report()),
+            "second.json": json.dumps(playwright_report()),
+        },
+    )
+
+    with pytest.raises(InvalidBundleError, match="exactly one Playwright JSON report"):
+        load_input(bundle)
+
+    assert len(created_dirs) == 1
+    assert not created_dirs[0].exists()
+
+
 @pytest.mark.parametrize(
     "member",
     [

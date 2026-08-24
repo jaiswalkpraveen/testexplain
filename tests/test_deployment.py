@@ -62,6 +62,15 @@ def test_render_configures_a_free_python_web_service():
     assert "--port $PORT" in start_command
 
 
+def test_render_requires_explicit_trusted_proxy_configuration():
+    service = render_service()
+
+    env_vars = {variable["key"]: variable for variable in service["envVars"]}
+
+    assert "--forwarded-allow-ips=*" not in service["startCommand"]
+    assert env_vars["TRUSTED_PROXY_IPS"]["sync"] is False
+
+
 def test_render_prompts_for_credentials_and_defaults_the_model():
     env_vars = {
         variable["key"]: variable for variable in render_service()["envVars"]

@@ -257,40 +257,50 @@ def analyze_input(
     The report owns correlation: only attachments listed by the current result
     are read. One broken artifact becomes a prompt warning, not a lost attempt.
     """
-    analyses: list[FailureAnalysis] = []
     with load_input(path) as loaded:
-        base_warnings = loaded.warnings[:]
-        for attempt in loaded.attempts:
-            failure = FailureContext(
-                test_title=attempt.title_path[-1] if attempt.title_path else "",
-                file=attempt.file,
-                status=attempt.status,
-                error_message=attempt.error_message,
-                error_stack=attempt.error_stack,
-                duration_ms=int(attempt.duration_ms),
+        return analyze_loaded_input(
+            loaded, gateway, total_token_budget=total_token_budget
+        )
+
+
+def analyze_loaded_input(
+    loaded: LoadedInput,
+    gateway: Gateway,
+    *,
+    total_token_budget: int = DEFAULT_TOTAL_TOKEN_BUDGET,
+) -> list[FailureAnalysis]:
+    """Analyze an already-validated input while its artifact directory is alive."""
+    analyses: list[FailureAnalysis] = []
+    base_warnings = loaded.warnings[:]
+    for attempt in loaded.attempts:
+        failure = FailureContext(
+            test_title=attempt.title_path[-1] if attempt.title_path else "",
+            file=attempt.file,
+            status=attempt.status,
+            error_message=attempt.error_message,
+            error_stack=attempt.error_stack,
+            duration_ms=int(attempt.duration_ms),
+        )
+        assembled = _assemble_attempt_evidence(
+            loaded, attempt, total_token_budget, base_warnings
+        )
+        prompt = build_prompt(
+            failure,
+            evidence=assembled,
+            project=attempt.project_name,
+            retry=attempt.retry,
+            flaky=attempt.eventually_passed,
+        )
+        analysis = generate_analysis(gateway, prompt, test_title=failure.test_title)
+        analyses.append(
+            analysis.model_copy(
+                update={
+                    "project": attempt.project_name,
+                    "retry": attempt.retry,
+                    "flaky": attempt.eventually_passed,
+                }
             )
-            assembled = _assemble_attempt_evidence(
-                loaded, attempt, total_token_budget, base_warnings
-            )
-            prompt = build_prompt(
-                failure,
-                evidence=assembled,
-                project=attempt.project_name,
-                retry=attempt.retry,
-                flaky=attempt.eventually_passed,
-            )
-            analysis = generate_analysis(
-                gateway, prompt, test_title=failure.test_title
-            )
-            analyses.append(
-                analysis.model_copy(
-                    update={
-                        "project": attempt.project_name,
-                        "retry": attempt.retry,
-                        "flaky": attempt.eventually_passed,
-                    }
-                )
-            )
+        )
     return analyses
 
 
