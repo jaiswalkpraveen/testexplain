@@ -1,8 +1,8 @@
-# TestExplain
+# testExplain
 
-> Most test reports tell you **what** failed. TestExplain tells you **why** — and (soon) proves its answers are right.
+> Most test reports tell you **what** failed. testExplain tells you **why** — and (soon) proves its answers are right.
 
-TestExplain is an AI-native test-failure triage platform. It ingests Playwright reports and uses an LLM to explain, in plain English, why each test failed and what to check first. It's built milestone-by-milestone as a learning-grade, framework-free AI engineering project.
+testExplain is an AI-native test-failure triage platform. It ingests Playwright reports and uses an LLM to explain, in plain English, why each test failed and what to check first. It's built milestone-by-milestone as a learning-grade, framework-free AI engineering project.
 
 **Status:** Milestone 0 established the walking skeleton. Milestone 1 adds structured, validated LLM output with corrective retries. Milestone 2 now builds multi-source, redacted evidence before prompt composition.
 
@@ -67,7 +67,7 @@ Next steps:
  - Re-run the test to determine whether the failure is intermittent
 ```
 
-The prompt asks for JSON, but TestExplain does not trust the model to comply. Every reply is parsed and validated at the system boundary. Invalid JSON, invented categories, missing fields, or out-of-range confidence values trigger a corrective retry.
+The prompt asks for JSON, but testExplain does not trust the model to comply. Every reply is parsed and validated at the system boundary. Invalid JSON, invented categories, missing fields, or out-of-range confidence values trigger a corrective retry.
 
 ### M2 — Multi-source context and safe evidence
 
@@ -159,7 +159,7 @@ LLM_MODEL=gateframe/opus-4.7
 
 `.env` is ignored by Git. Never commit a real API key. The tracked `.env.example` file documents the required variable names without storing secrets.
 
-For a no-auth self-hosted endpoint, keep `LLM_API_KEY=` present but empty. TestExplain supplies an internal placeholder because the OpenAI client requires a non-empty value even when the server ignores authentication.
+For a no-auth self-hosted endpoint, keep `LLM_API_KEY=` present but empty. testExplain supplies an internal placeholder because the OpenAI client requires a non-empty value even when the server ignores authentication.
 
 Run a real analysis:
 
@@ -173,13 +173,15 @@ uv run testexplain analyze tests/fixtures/sample_report.json
 make run-api
 ```
 
-Then open `http://127.0.0.1:8000/docs`. The endpoint is:
+Then open `http://127.0.0.1:8000/docs`. The development-only local-path endpoint is:
 
 ```text
 GET /analyze?report_path=tests/fixtures/sample_report.json&fake=true
 ```
 
-Use `fake=true` for an offline dry run or `fake=false` for the configured real endpoint.
+Set `TESTEXPLAIN_ENABLE_LOCAL_PATH_API=true` before using that endpoint. It is
+disabled by default so a public deployment cannot read caller-supplied server
+paths. Use `fake=true` for an offline dry run.
 
 To analyze a bundled report through the API:
 
@@ -191,6 +193,75 @@ curl -X POST http://127.0.0.1:8000/analyze-bundle \
 
 See the [artifact collection guide](docs/guides/collecting-artifacts.md) for
 the complete report, trace, HAR, bundling, and troubleshooting workflow.
+
+## Shareable Demo Portal
+
+`render.yaml` deploys the FastAPI portal as a Render free web service. It
+supports the full 50 MiB ZIP-file limit, unlike serverless hosts with small
+request-body caps. A free Render instance sleeps when idle, so the first request
+can take roughly 30 seconds to wake.
+
+### Deploy On Render
+
+1. Push the desired branch and connect `jaiswalkpraveen/testexplain` in Render.
+2. Create a web service from this repository's `render.yaml` Blueprint.
+3. In Render's Environment settings, set these secrets:
+
+```text
+LLM_BASE_URL=https://router.gateframe.ai/v1
+LLM_API_KEY=your-demo-provider-key
+LLM_MODEL=your-low-cost-demo-model
+```
+
+4. Set `TRUSTED_PROXY_IPS` to the immediate Render ingress address or addresses
+   observed for the service, separated by commas. Only these peers may supply a
+   forwarded client address for the demo quota. Without it, the portal uses the
+   direct peer address: safe against spoofing, but colleagues can share a quota
+   bucket.
+5. Set a provider-side spending limit before enabling `LLM_API_KEY`. Removing
+   that variable disables server-funded demo mode immediately.
+6. Deploy and open the generated `https://...onrender.com` URL.
+
+Demo mode is limited to 10 requests per client per hour in the single Render
+process. It is a feedback-demo guardrail, not authentication or durable billing
+protection. The counter resets after a restart; use authentication and a shared
+store before treating it as a production quota system.
+
+### Portal Providers
+
+The browser never sends a provider URL. A colleague selects a named provider,
+supplies a transient key and model, and the server maps the name to a fixed
+trusted endpoint:
+
+| Provider | Key is sent to | Example model |
+| --- | --- | --- |
+| Demo | server-configured `LLM_BASE_URL` | your configured low-cost model |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4.1-mini` |
+| Anthropic | Anthropic Messages API | `claude-sonnet-4-5` |
+| OpenRouter | `https://openrouter.ai/api/v1` | a model exposed by OpenRouter |
+
+BYOK values are used only for the request and are not stored. Custom endpoints,
+LAN model servers, and arbitrary `base_url` values are rejected by the public
+portal to prevent server-side request forgery. Use the CLI or local API for
+self-hosted endpoints.
+
+### Colleague Feedback Flow
+
+1. Run **Report only**.
+2. Run **Report + trace**.
+3. Run **Report + trace + HAR**.
+4. Run **Missing trace** and confirm the evidence-gap warning is visible.
+5. Optionally upload a real failure bundle larger than 4.5 MB and smaller than
+   50 MiB to prove the portal is not constrained by a small serverless limit.
+6. Optionally select OpenAI, Anthropic, or OpenRouter and enter a personal key
+   and model.
+7. Record whether the explanation, cited evidence, confidence, and next steps
+   were clear and useful.
+
+The four samples are synthetic M2 fixtures. They demonstrate **evidence
+ablation**: hold the same failure constant, then observe how report-only,
+trace, and HAR context change the available explanation. They do not yet prove
+model answer quality; M3 and M4 add classification measurement and evaluation.
 
 ## Testing
 

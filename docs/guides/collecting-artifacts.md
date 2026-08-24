@@ -174,12 +174,41 @@ curl -X POST http://127.0.0.1:8000/analyze-bundle \
   -F "fake=true"
 ```
 
-The endpoint streams the compressed upload to a temporary file, limits it to
-50 MiB, analyzes it, and deletes the temporary file after success or failure.
-The bundle reader's expansion limits still apply after upload. A real gateway
-requires `api_key`, `base_url`, and `model` configuration as documented by the
-API; never put a real key in a report, HAR, trace, shell history, or committed
-fixture.
+The endpoint streams the compressed upload to a temporary file, limits the ZIP
+file itself to 50 MiB, validates its native Playwright report before choosing a
+gateway, and deletes temporary files after success or failure. The bundle
+reader's expansion limits still apply after upload.
+
+For a local API, `fake=true` remains the simplest offline mode. The shareable
+portal does not accept arbitrary `base_url` values. Instead, BYOK uses a named
+provider plus an API key and model:
+
+```text
+openai     -> https://api.openai.com/v1
+anthropic  -> Anthropic Messages API
+openrouter -> https://openrouter.ai/api/v1
+```
+
+This prevents a public upload endpoint from making requests to a caller-chosen
+internal URL. Portal BYOK keys are transient and not stored. Never put a real
+key in a report, HAR, trace, shell history, or committed fixture.
+
+## Shareable Portal Checks
+
+On the Render portal, use the four packaged samples to demonstrate M2 evidence
+ablation before uploading a real artifact:
+
+1. **Report only** shows report error, stdout, and stderr context.
+2. **Report + trace** adds Playwright action and browser-output context.
+3. **Report + trace + HAR** adds HAR network context.
+4. **Missing trace** demonstrates a visible evidence-gap warning instead of a
+   fabricated trace explanation.
+
+The server demo key is limited to 10 requests per client per hour. A `429`
+response means the demo budget is exhausted; wait for the window to reset or
+use a named BYOK provider. Review the portal deployment instructions in the
+repository README before making the URL public, including the provider spending
+cap and `TRUSTED_PROXY_IPS` configuration.
 
 ## Troubleshooting
 
