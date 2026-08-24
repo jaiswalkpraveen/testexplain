@@ -5,3 +5,4 @@ uvicorn>=0.30
 typer>=0.12
 openai>=2.45.0
 python-dotenv>=1.2.2
+python-multipart>=0.0.32
