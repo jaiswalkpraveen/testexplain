@@ -12,6 +12,7 @@ is always intercepted (patched ``analyze_report`` or a FakeGateway).
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 import testexplain.api as api
@@ -61,6 +62,31 @@ def _forbid_real_gateway(monkeypatch):
         )
 
     monkeypatch.setattr(api, "OpenAICompatibleGateway", must_not_construct)
+
+
+def _forbid_analysis(monkeypatch):
+    """Requests rejected during gateway selection must never reach analysis."""
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("analysis must not run when demo config is incomplete")
+
+    monkeypatch.setattr(api, "analyze_report", must_not_run)
+
+
+def _set_demo_env_without(monkeypatch, var: str, blank_value: str | None):
+    """Demo env with one var either unset (None) or set to an empty string."""
+    _set_demo_env(monkeypatch)
+    if blank_value is None:
+        monkeypatch.delenv(var)
+    else:
+        monkeypatch.setenv(var, blank_value)
+
+
+def _assert_demo_not_configured(detail: str):
+    assert "demo mode is not configured" in detail.lower()
+    for var in DEMO_ENV:
+        assert var in detail
+    assert "api_key" in detail
 
 
 def _create_native_bundle(tmp_path: Path) -> Path:
@@ -113,11 +139,24 @@ def test_post_analyze_demo_without_server_config_returns_422(monkeypatch):
     response = client.post("/analyze", json={"report": REPORT_TEXT, "demo": True})
 
     assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert "demo mode is not configured" in detail.lower()
-    for var in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
-        assert var in detail
-    assert "api_key" in detail
+    _assert_demo_not_configured(response.json()["detail"])
+
+
+# Demo mode is a public, server-funded path, so it demands a complete and
+# non-empty LLM_* trio. Removing OR blanking any single variable must be
+# refused — including LLM_API_KEY alone, which the gateway itself tolerates
+# (empty key => "unused") for no-auth LAN endpoints.
+@pytest.mark.parametrize("missing", sorted(DEMO_ENV))
+@pytest.mark.parametrize("blank_value", [None, "", "   "])
+def test_post_analyze_demo_requires_every_server_var(monkeypatch, missing, blank_value):
+    client = TestClient(app)
+    _set_demo_env_without(monkeypatch, missing, blank_value)
+    _forbid_analysis(monkeypatch)
+
+    response = client.post("/analyze", json={"report": REPORT_TEXT, "demo": True})
+
+    assert response.status_code == 422
+    _assert_demo_not_configured(response.json()["detail"])
 
 
 def test_post_analyze_byok_takes_precedence_over_demo(monkeypatch):
@@ -250,6 +289,30 @@ def test_post_analyze_bundle_demo_without_server_config_returns_422_and_deletes_
     for var in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
         assert var in detail
     assert "api_key" in detail
+    assert len(created) == 1
+    assert not created[0].exists()
+
+
+@pytest.mark.parametrize("missing", sorted(DEMO_ENV))
+@pytest.mark.parametrize("blank_value", [None, "", "   "])
+def test_post_analyze_bundle_demo_requires_every_server_var_and_deletes_temp_file(
+    tmp_path, monkeypatch, missing, blank_value
+):
+    client = TestClient(app)
+    bundle_path = _create_native_bundle(tmp_path)
+    _set_demo_env_without(monkeypatch, missing, blank_value)
+    created = _capture_temp_uploads(monkeypatch, tmp_path)
+    _forbid_analysis(monkeypatch)
+
+    with bundle_path.open("rb") as bundle:
+        response = client.post(
+            "/analyze-bundle",
+            data={"demo": "true"},
+            files={"bundle": ("bundle.zip", bundle, "application/zip")},
+        )
+
+    assert response.status_code == 422
+    _assert_demo_not_configured(response.json()["detail"])
     assert len(created) == 1
     assert not created[0].exists()
 

@@ -34,6 +34,8 @@ app = FastAPI(title="TestLens", description="Explain why your tests failed.")
 MAX_BUNDLE_UPLOAD_BYTES = 50 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 BUNDLE_UPLOAD_PATH = "/analyze-bundle"
+# Demo mode spends the server's own quota, so it requires the full trio.
+DEMO_ENV_VARS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
 
 
 class _BundleUploadTooLarge(BaseException):
@@ -109,17 +111,21 @@ def _gateway_for_request(
             model=model,
         )
     if demo:
-        try:
-            return OpenAICompatibleGateway()
-        except KeyError as exc:
+        # Stricter than the gateway itself, which tolerates an empty
+        # LLM_API_KEY for no-auth LAN endpoints. A public demo must not
+        # silently fall back to an unauthenticated call.
+        missing = [name for name in DEMO_ENV_VARS if not os.environ.get(name, "").strip()]
+        if missing:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"Demo mode is not configured on this server (missing {exc}). "
-                    "Set LLM_API_KEY, LLM_BASE_URL and LLM_MODEL, "
+                    "Demo mode is not configured on this server "
+                    f"(missing {', '.join(missing)}). "
+                    f"Set {', '.join(DEMO_ENV_VARS)}, "
                     "or provide your own api_key."
                 ),
-            ) from exc
+            )
+        return OpenAICompatibleGateway()
     raise HTTPException(
         status_code=422,
         detail="api_key is required when fake is false.",
