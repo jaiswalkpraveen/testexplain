@@ -751,3 +751,7 @@ def test_index_offers_m2_sample_actions_and_safe_provider_controls():
         assert f'value="{provider}"' in html
     assert 'id="baseUrl"' not in html
     assert "base_url" not in html.split("<script>")[0]
+    # Manual submissions share the same busy state as samples, and a server
+    # 429 must not surface an "undefined:" prefix when no label is present.
+    assert "setAnalysisBusy(true)" in html
+    assert 'const prefix = label ? `${label}: ` : "";' in html

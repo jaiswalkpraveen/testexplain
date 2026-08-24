@@ -259,8 +259,9 @@ form.addEventListener("submit", async (e) => {
  }
  errorDiv.textContent = "";
 resultsDiv.innerHTML = "";
-submitBtn.classList.add("loading");
-submitBtn.disabled = true;
+  submitBtn.classList.add("loading");
+  submitBtn.disabled = true;
+  setSamplesDisabled(true);
 
 try {
 let res;
@@ -295,8 +296,9 @@ if (!report.trim()) { throw new Error("Paste or upload a Playwright JSON report,
 } catch (err) {
     errorDiv.textContent = err.message;
  } finally {
- submitBtn.classList.remove("loading");
- submitBtn.disabled = pendingJsonRead;
+    submitBtn.classList.remove("loading");
+    submitBtn.disabled = pendingJsonRead;
+    setSamplesDisabled(false);
   }
 });
 
@@ -337,7 +339,7 @@ async function runSample(btn) {
   const label = btn.dataset.label;
   errorDiv.textContent = "";
   resultsDiv.innerHTML = "";
-  setSamplesDisabled(true);
+  setAnalysisBusy(true);
   btn.textContent = `Running ${label}...`;
   try {
     let res;
@@ -359,13 +361,20 @@ async function runSample(btn) {
   } catch (err) {
     errorDiv.textContent = err.message;
   } finally {
-    setSamplesDisabled(false);
+    setAnalysisBusy(false);
     btn.textContent = label;
   }
 }
 
 function setSamplesDisabled(disabled) {
   document.querySelectorAll(".sample-btn").forEach((b) => (b.disabled = disabled));
+}
+
+// Shared busy state: a sample run and a manual submission must never overlap,
+// because both write to the same results and error areas.
+function setAnalysisBusy(busy) {
+  setSamplesDisabled(busy);
+  submitBtn.disabled = busy || pendingJsonRead;
 }
 
 document.querySelectorAll(".sample-btn").forEach((btn) => {
@@ -375,7 +384,8 @@ document.querySelectorAll(".sample-btn").forEach((btn) => {
 async function renderResponse(res, label) {
   if (!res.ok) {
     const detail = await responseError(res);
-    throw new Error(res.status === 429 ? `${label}: ${detail}` : detail);
+    const prefix = label ? `${label}: ` : "";
+    throw new Error(`${prefix}${detail}`);
   }
   const data = await res.json();
   if (!Array.isArray(data)) { throw new Error(`Unexpected response from server (${res.status}).`); }
