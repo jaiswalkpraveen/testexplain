@@ -428,18 +428,18 @@ def test_post_analyze_bundle_passes_byok_fields_and_deletes_temp_file_on_success
     monkeypatch.setattr(api, "OpenAICompatibleGateway", CapturingGateway)
     with bundle_path.open("rb") as bundle:
         response = client.post(
-            "/analyze-bundle",
-            data={
-                "api_key": "byok-key",
-                "base_url": "https://llm.example/v1",
-                "model": "test-model",
+        "/analyze-bundle",
+        data={
+            "provider": "openai",
+            "api_key": "byok-key",
+            "model": "test-model",
             },
             files={"bundle": ("bundle.zip", bundle, "application/zip")},
         )
 
     assert response.status_code == 200, response.text
     assert [(gateway.api_key, gateway.base_url, gateway.model) for gateway in gateways] == [
-        ("byok-key", "https://llm.example/v1", "test-model")
+        ("byok-key", "https://api.openai.com/v1", "test-model")
     ]
     assert len(created) == 1
     assert not created[0].exists()
@@ -458,11 +458,11 @@ def test_post_analyze_bundle_propagates_invalid_llm_response_as_server_error(
     monkeypatch.setattr(api, "OpenAICompatibleGateway", InvalidResponseGateway)
     with bundle_path.open("rb") as bundle:
         response = client.post(
-            "/analyze-bundle",
-            data={
-                "api_key": "byok-key",
-                "base_url": "https://llm.example/v1",
-                "model": "test-model",
+        "/analyze-bundle",
+        data={
+            "provider": "openai",
+            "api_key": "byok-key",
+            "model": "test-model",
             },
             files={"bundle": ("bundle.zip", bundle, "application/zip")},
         )

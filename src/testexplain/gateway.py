@@ -117,13 +117,19 @@ class AnthropicGateway:
     package or an API key.
     """
 
-    def __init__(self, model: str = "claude-3-5-sonnet-latest") -> None:
+    def __init__(
+        self,
+        model: str = "claude-3-5-sonnet-latest",
+        api_key: str | None = None,
+    ) -> None:
         import os
 
         from anthropic import Anthropic
 
         self.model = model
-        self.client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self.client = Anthropic(
+            api_key=api_key if api_key is not None else os.environ["ANTHROPIC_API_KEY"]
+        )
 
     def generate(self, prompt: str) -> str:
         message = self.client.messages.create(

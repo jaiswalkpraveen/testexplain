@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 import testexplain.api as api
 from testexplain.api import app
-from testexplain.gateway import FakeGateway, OpenAICompatibleGateway
+from testexplain.gateway import AnthropicGateway, FakeGateway, OpenAICompatibleGateway
 from testexplain.ingestion.package import create_bundle
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_report.json"
@@ -62,6 +62,18 @@ def _forbid_real_gateway(monkeypatch):
         )
 
     monkeypatch.setattr(api, "OpenAICompatibleGateway", must_not_construct)
+
+
+def _forbid_provider_gateways(monkeypatch):
+    """Rejected public BYOK requests must not construct any real gateway."""
+
+    def must_not_construct(*args, **kwargs):
+        raise AssertionError(
+            f"A provider gateway must not be constructed (args={args}, kwargs={kwargs})"
+        )
+
+    monkeypatch.setattr(api, "OpenAICompatibleGateway", must_not_construct)
+    monkeypatch.setattr(api, "AnthropicGateway", must_not_construct)
 
 
 def _forbid_analysis(monkeypatch):
@@ -178,16 +190,104 @@ def test_post_analyze_byok_takes_precedence_over_demo(monkeypatch):
         json={
             "report": REPORT_TEXT,
             "demo": True,
+            "provider": "openai",
             "api_key": "byok-key",
-            "base_url": "https://llm.example/v1",
             "model": "byok-model",
         },
     )
 
     assert response.status_code == 200, response.text
     assert [(g.api_key, g.base_url, g.model) for g in gateways] == [
-        ("byok-key", "https://llm.example/v1", "byok-model")
+        ("byok-key", "https://api.openai.com/v1", "byok-model")
     ]
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", "https://api.openai.com/v1"),
+        ("openrouter", "https://openrouter.ai/api/v1"),
+    ],
+)
+def test_post_analyze_byok_uses_fixed_openai_compatible_provider_url(
+    monkeypatch, provider, base_url
+):
+    client = TestClient(app)
+    gateways = []
+
+    class CapturingGateway(FakeGateway):
+        def __init__(self, *, api_key=None, base_url=None, model=None):
+            super().__init__()
+            self.api_key = api_key
+            self.base_url = base_url
+            self.model = model
+            gateways.append(self)
+
+    monkeypatch.setattr(api, "OpenAICompatibleGateway", CapturingGateway)
+    response = client.post(
+        "/analyze",
+        json={
+            "report": REPORT_TEXT,
+            "provider": provider,
+            "api_key": "byok-key",
+            "model": "frontier-model",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert [(g.api_key, g.base_url, g.model) for g in gateways] == [
+        ("byok-key", base_url, "frontier-model")
+    ]
+
+
+def test_post_analyze_byok_uses_direct_anthropic_gateway(monkeypatch):
+    client = TestClient(app)
+    gateways = []
+
+    class CapturingGateway(FakeGateway):
+        def __init__(self, *, api_key=None, model=None):
+            super().__init__()
+            self.api_key = api_key
+            self.model = model
+            gateways.append(self)
+
+    monkeypatch.setattr(api, "AnthropicGateway", CapturingGateway)
+    response = client.post(
+        "/analyze",
+        json={
+            "report": REPORT_TEXT,
+            "provider": "anthropic",
+            "api_key": "anthropic-key",
+            "model": "claude-sonnet-4-5",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert [(g.api_key, g.model) for g in gateways] == [
+        ("anthropic-key", "claude-sonnet-4-5")
+    ]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"api_key": "byok-key", "model": "model"},
+        {"provider": "unknown", "api_key": "byok-key", "model": "model"},
+        {
+            "provider": "openai",
+            "api_key": "byok-key",
+            "model": "model",
+            "base_url": "http://169.254.169.254/latest",
+        },
+    ],
+)
+def test_post_analyze_rejects_unsafe_byok_provider_configuration(monkeypatch, fields):
+    client = TestClient(app)
+    _forbid_provider_gateways(monkeypatch)
+
+    response = client.post("/analyze", json={"report": REPORT_TEXT, **fields})
+
+    assert response.status_code == 422
 
 
 @pytest.mark.parametrize(
@@ -222,7 +322,10 @@ def test_post_analyze_rejects_partial_byok_before_constructing_gateway(
     response = client.post("/analyze", json={"report": REPORT_TEXT, **fields})
 
     assert response.status_code == 422
-    assert "BYOK requires request-level" in response.json()["detail"]
+    assert (
+        "BYOK requires request-level" in response.json()["detail"]
+        or "Custom base_url values" in response.json()["detail"]
+    )
 
 
 def test_post_analyze_fake_takes_precedence_over_byok_and_demo(monkeypatch):
@@ -237,8 +340,8 @@ def test_post_analyze_fake_takes_precedence_over_byok_and_demo(monkeypatch):
             "report": REPORT_TEXT,
             "fake": True,
             "demo": True,
+            "provider": "openai",
             "api_key": "byok-key",
-            "base_url": "https://llm.example/v1",
             "model": "byok-model",
         },
     )
@@ -370,19 +473,79 @@ def test_post_analyze_bundle_byok_takes_precedence_over_demo(tmp_path, monkeypat
     with bundle_path.open("rb") as bundle:
         response = client.post(
             "/analyze-bundle",
-            data={
-                "demo": "true",
-                "api_key": "byok-key",
-                "base_url": "https://llm.example/v1",
-                "model": "byok-model",
+        data={
+            "demo": "true",
+            "provider": "openai",
+            "api_key": "byok-key",
+            "model": "byok-model",
             },
             files={"bundle": ("bundle.zip", bundle, "application/zip")},
         )
 
     assert response.status_code == 200, response.text
     assert [(g.api_key, g.base_url, g.model) for g in gateways] == [
-        ("byok-key", "https://llm.example/v1", "byok-model")
+        ("byok-key", "https://api.openai.com/v1", "byok-model")
     ]
+
+
+def test_post_analyze_bundle_byok_uses_direct_anthropic_gateway(tmp_path, monkeypatch):
+    client = TestClient(app)
+    bundle_path = _create_native_bundle(tmp_path)
+    gateways = []
+
+    class CapturingGateway(FakeGateway):
+        def __init__(self, *, api_key=None, model=None):
+            super().__init__()
+            self.api_key = api_key
+            self.model = model
+            gateways.append(self)
+
+    monkeypatch.setattr(api, "AnthropicGateway", CapturingGateway)
+    with bundle_path.open("rb") as bundle:
+        response = client.post(
+            "/analyze-bundle",
+            data={
+                "provider": "anthropic",
+                "api_key": "anthropic-key",
+                "model": "claude-sonnet-4-5",
+            },
+            files={"bundle": ("bundle.zip", bundle, "application/zip")},
+        )
+
+    assert response.status_code == 200, response.text
+    assert [(g.api_key, g.model) for g in gateways] == [
+        ("anthropic-key", "claude-sonnet-4-5")
+    ]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"api_key": "byok-key", "model": "model"},
+        {"provider": "unknown", "api_key": "byok-key", "model": "model"},
+        {
+            "provider": "openrouter",
+            "api_key": "byok-key",
+            "model": "model",
+            "base_url": "http://127.0.0.1:9/v1",
+        },
+    ],
+)
+def test_post_analyze_bundle_rejects_unsafe_byok_provider_configuration(
+    tmp_path, monkeypatch, fields
+):
+    client = TestClient(app)
+    bundle_path = _create_native_bundle(tmp_path)
+    _forbid_provider_gateways(monkeypatch)
+
+    with bundle_path.open("rb") as bundle:
+        response = client.post(
+            "/analyze-bundle",
+            data=fields,
+            files={"bundle": ("bundle.zip", bundle, "application/zip")},
+        )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.parametrize(
@@ -423,7 +586,10 @@ def test_post_analyze_bundle_rejects_partial_byok_before_constructing_gateway(
         )
 
     assert response.status_code == 422
-    assert "BYOK requires request-level" in response.json()["detail"]
+    assert (
+        "BYOK requires request-level" in response.json()["detail"]
+        or "Custom base_url values" in response.json()["detail"]
+    )
 
 
 def test_post_analyze_bundle_fake_takes_precedence_over_byok_and_demo(
@@ -438,12 +604,12 @@ def test_post_analyze_bundle_fake_takes_precedence_over_byok_and_demo(
     with bundle_path.open("rb") as bundle:
         response = client.post(
             "/analyze-bundle",
-            data={
-                "fake": "true",
-                "demo": "true",
-                "api_key": "byok-key",
-                "base_url": "https://llm.example/v1",
-                "model": "byok-model",
+        data={
+            "fake": "true",
+            "demo": "true",
+            "provider": "openai",
+            "api_key": "byok-key",
+            "model": "byok-model",
             },
             files={"bundle": ("bundle.zip", bundle, "application/zip")},
         )

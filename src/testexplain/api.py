@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from testexplain.core import analyze_report
-from testexplain.gateway import FakeGateway, OpenAICompatibleGateway
+from testexplain.gateway import AnthropicGateway, FakeGateway, OpenAICompatibleGateway
 from testexplain.ingestion.input_reader import InvalidBundleError
 from testexplain.models import FailureAnalysis
 
@@ -46,6 +46,11 @@ UPLOAD_LIMITS = {
 }
 # Demo mode spends the server's own quota, so it requires the full trio.
 DEMO_ENV_VARS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
+BYOK_PROVIDER_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
+BYOK_PROVIDERS = frozenset({*BYOK_PROVIDER_URLS, "anthropic"})
 
 
 class _UploadTooLarge(BaseException):
@@ -98,6 +103,7 @@ app.add_middleware(UploadSizeLimitMiddleware)
 def _gateway_for_request(
     *,
     api_key: str | None,
+    provider: str | None,
     base_url: str | None,
     model: str | None,
     fake: bool,
@@ -111,13 +117,24 @@ def _gateway_for_request(
     """
     if fake:
         return FakeGateway()
-    byok_fields = {"api_key": api_key, "base_url": base_url, "model": model}
+    byok_fields = {
+        "provider": provider,
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+    }
     if byok_supplied is None:
         byok_supplied = any(value is not None for value in byok_fields.values())
     if byok_supplied:
+        if base_url is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Custom base_url values are not supported by the public portal.",
+            )
         missing = [
             name
             for name, value in byok_fields.items()
+            if name != "base_url"
             if not value or not value.strip()
         ]
         if missing:
@@ -125,9 +142,16 @@ def _gateway_for_request(
                 status_code=422,
                 detail=f"BYOK requires request-level {', '.join(missing)}.",
             )
+        if provider not in BYOK_PROVIDERS:
+            raise HTTPException(
+                status_code=422,
+                detail="Unsupported BYOK provider. Choose openai, anthropic, or openrouter.",
+            )
+        if provider == "anthropic":
+            return AnthropicGateway(api_key=api_key, model=model)
         return OpenAICompatibleGateway(
             api_key=api_key,
-            base_url=base_url,
+            base_url=BYOK_PROVIDER_URLS[provider],
             model=model,
         )
     if demo:
@@ -183,6 +207,7 @@ def analyze(report_path: str, fake: bool = False) -> list[FailureAnalysis]:
 
 class AnalyzeRequest(BaseModel):
     report: str
+    provider: str | None = None
     api_key: str | None = None
     base_url: str | None = None
     model: str | None = None
@@ -209,6 +234,7 @@ def analyze_post(body: AnalyzeRequest) -> list[FailureAnalysis]:
 
     gateway = _gateway_for_request(
         api_key=body.api_key,
+        provider=body.provider,
         base_url=body.base_url,
         model=body.model,
         fake=body.fake,
@@ -253,6 +279,7 @@ def _write_tmp_report(content: str) -> str:
 async def analyze_bundle(
     request: Request,
     bundle: UploadFile = File(...),
+    provider: str | None = Form(default=None),
     api_key: str | None = Form(default=None),
     base_url: str | None = Form(default=None),
     model: str | None = Form(default=None),
@@ -278,12 +305,14 @@ async def analyze_bundle(
         form_data = await request.form()
         gateway = _gateway_for_request(
             api_key=api_key,
+            provider=provider,
             base_url=base_url,
             model=model,
             fake=fake,
             demo=demo,
             byok_supplied=any(
-                name in form_data for name in ("api_key", "base_url", "model")
+                name in form_data
+                for name in ("provider", "api_key", "base_url", "model")
             ),
         )
 
