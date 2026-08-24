@@ -16,10 +16,33 @@ def render_service() -> dict:
     return services[0]
 
 
+def requirements_lock() -> str:
+    return (ROOT / "requirements.lock").read_text()
+
+
 def test_requirements_include_python_multipart_for_form_uploads():
     requirements = (ROOT / "requirements.txt").read_text()
 
     assert "python-multipart>=0.0.32" in requirements
+
+
+def test_requirements_lock_pins_runtime_dependencies_with_hashes():
+    lock = requirements_lock()
+
+    assert "python-multipart==" in lock
+    assert "fastapi==" in lock
+    assert "uvicorn==" in lock
+    assert "--hash=sha256:" in lock
+    assert ">=" not in lock
+
+
+def test_requirements_lock_excludes_dev_dependencies_and_the_project():
+    lock = requirements_lock()
+
+    assert "pytest==" not in lock
+    assert "pyyaml==" not in lock
+    assert "-e ." not in lock
+    assert "testexplain==" not in lock
 
 
 def test_render_configures_a_free_python_web_service():
@@ -30,7 +53,9 @@ def test_render_configures_a_free_python_web_service():
     assert service["name"] == "testexplain"
     assert service["runtime"] == "python"
     assert service["plan"] == "free"
-    assert service["buildCommand"] == "pip install -r requirements.txt"
+    assert service["buildCommand"] == (
+        "pip install --require-hashes -r requirements.lock"
+    )
     assert "PYTHONPATH=src" in start_command
     assert "uvicorn testexplain.api:app" in start_command
     assert "--host 0.0.0.0" in start_command

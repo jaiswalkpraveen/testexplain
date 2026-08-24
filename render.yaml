@@ -2,7 +2,7 @@ services:
   - type: web
     name: testexplain
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --require-hashes -r requirements.lock
     startCommand: PYTHONPATH=src uvicorn testexplain.api:app --host 0.0.0.0 --port $PORT
     plan: free
     envVars:
