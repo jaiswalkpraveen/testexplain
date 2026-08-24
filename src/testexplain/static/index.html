@@ -180,6 +180,7 @@ const modelInput = document.getElementById("model");
 
 let selectedZip = null;
 let pendingJsonRead = false;
+let analysisBusy = false;
 
 // Keep in sync with MAX_BUNDLE_UPLOAD_BYTES in api.py.
 const MAX_BUNDLE_BYTES = 50 * 1024 * 1024;
@@ -195,10 +196,10 @@ zipName.textContent = "";
 }
 
 function finishJsonRead(token) {
- if (token === readToken) {
- pendingJsonRead = false;
- submitBtn.disabled = false;
- }
+  if (token === readToken) {
+    pendingJsonRead = false;
+    syncAnalysisControls();
+  }
 }
 
 fileInput.addEventListener("change", () => {
@@ -219,18 +220,18 @@ if (file) {
 });
 
 reportText.addEventListener("input", () => {
- readToken++; // manual edits invalidate any pending file read
- pendingJsonRead = false;
- submitBtn.disabled = false;
-if (reportText.value) clearZipSelection();
+  readToken++; // manual edits invalidate any pending file read
+  pendingJsonRead = false;
+  syncAnalysisControls();
+  if (reportText.value) clearZipSelection();
 });
 
 zipInput.addEventListener("change", () => {
 const file = zipInput.files[0];
 if (file) {
- readToken++; // invalidate any pending JSON read
- pendingJsonRead = false;
- submitBtn.disabled = false;
+    readToken++; // invalidate any pending JSON read
+    pendingJsonRead = false;
+    syncAnalysisControls();
 selectedZip = file;
 zipName.textContent = file.name;
 reportText.value = "";
@@ -252,16 +253,16 @@ async function responseError(res) {
 }
 
 form.addEventListener("submit", async (e) => {
- e.preventDefault();
- if (pendingJsonRead) {
+  e.preventDefault();
+  if (analysisBusy) return;
+  if (pendingJsonRead) {
  errorDiv.textContent = "Wait for the JSON file to finish loading.";
  return;
  }
- errorDiv.textContent = "";
-resultsDiv.innerHTML = "";
+  errorDiv.textContent = "";
+  resultsDiv.innerHTML = "";
   submitBtn.classList.add("loading");
-  submitBtn.disabled = true;
-  setSamplesDisabled(true);
+  setAnalysisBusy(true);
 
 try {
 let res;
@@ -295,10 +296,9 @@ if (!report.trim()) { throw new Error("Paste or upload a Playwright JSON report,
     await renderResponse(res);
 } catch (err) {
     errorDiv.textContent = err.message;
- } finally {
+  } finally {
     submitBtn.classList.remove("loading");
-    submitBtn.disabled = pendingJsonRead;
-    setSamplesDisabled(false);
+    setAnalysisBusy(false);
   }
 });
 
@@ -334,6 +334,7 @@ modelInput.disabled = true;
 // Sample buttons: fetch a packaged M2 fixture and submit it through the same
 // endpoints as manual uploads, always using the server demo key.
 async function runSample(btn) {
+if (analysisBusy) return;
   const path = btn.dataset.sample;
   const kind = btn.dataset.kind;
   const label = btn.dataset.label;
@@ -344,14 +345,14 @@ async function runSample(btn) {
   try {
     let res;
     if (kind === "report") {
-      const report = await fetch(path).then((r) => r.text());
+      const report = await (await fetchSample(path, label)).text();
       res = await fetch("/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ report, demo: true }),
       });
     } else {
-      const blob = await fetch(path).then((r) => r.blob());
+      const blob = await (await fetchSample(path, label)).blob();
       const formData = new FormData();
       formData.append("bundle", blob, path.split("/").pop());
       formData.append("demo", "true");
@@ -368,6 +369,14 @@ async function runSample(btn) {
 
 function setSamplesDisabled(disabled) {
   document.querySelectorAll(".sample-btn").forEach((b) => (b.disabled = disabled));
+}
+
+async function fetchSample(path, label) {
+  const response = await fetch(path);
+  if (!response.ok) {
+    throw new Error(`Could not load the ${label} sample (${response.status}).`);
+  }
+  return response;
 }
 
 // Shared busy state: a sample run and a manual submission must never overlap,
