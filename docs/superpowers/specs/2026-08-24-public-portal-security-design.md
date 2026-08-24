@@ -1,6 +1,6 @@
 # Public Portal Security Design
 
-**Status:** Approved  
+**Status:** Approved
 **Date:** 2026-08-24
 
 ## Goal
