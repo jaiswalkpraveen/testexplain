@@ -52,6 +52,17 @@ def _capture_gateway(monkeypatch) -> list:
     return captured
 
 
+def _forbid_real_gateway(monkeypatch):
+    """Make constructing the real gateway an outright test failure."""
+
+    def must_not_construct(*args, **kwargs):
+        raise AssertionError(
+            f"OpenAICompatibleGateway must not be constructed (args={args}, kwargs={kwargs})"
+        )
+
+    monkeypatch.setattr(api, "OpenAICompatibleGateway", must_not_construct)
+
+
 def _create_native_bundle(tmp_path: Path) -> Path:
     report = json.loads(REPORT_TEXT)
     report.update(config={}, errors=[], stats={})
@@ -140,19 +151,41 @@ def test_post_analyze_byok_takes_precedence_over_demo(monkeypatch):
     ]
 
 
-def test_post_analyze_fake_takes_precedence_over_demo(monkeypatch):
+def test_post_analyze_fake_takes_precedence_over_byok_and_demo(monkeypatch):
     client = TestClient(app)
-    _clear_demo_env(monkeypatch)  # fake must work with zero server config
+    _set_demo_env(monkeypatch)
+    # Neither the BYOK branch nor the demo branch may build a real gateway.
+    _forbid_real_gateway(monkeypatch)
 
     response = client.post(
         "/analyze",
-        json={"report": REPORT_TEXT, "fake": True, "demo": True},
+        json={
+            "report": REPORT_TEXT,
+            "fake": True,
+            "demo": True,
+            "api_key": "byok-key",
+            "base_url": "https://llm.example/v1",
+            "model": "byok-model",
+        },
     )
 
     assert response.status_code == 200, response.text
     data = response.json()
     assert len(data) == 1
     assert "FAKE:" in data[0]["summary"]
+
+
+def test_post_analyze_fake_works_without_any_server_config(monkeypatch):
+    client = TestClient(app)
+    _clear_demo_env(monkeypatch)  # fake must work fully offline
+
+    response = client.post(
+        "/analyze",
+        json={"report": REPORT_TEXT, "fake": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "FAKE:" in response.json()[0]["summary"]
 
 
 def test_post_analyze_without_key_fake_or_demo_still_requires_api_key(monkeypatch):
@@ -254,15 +287,25 @@ def test_post_analyze_bundle_byok_takes_precedence_over_demo(tmp_path, monkeypat
     ]
 
 
-def test_post_analyze_bundle_fake_takes_precedence_over_demo(tmp_path, monkeypatch):
+def test_post_analyze_bundle_fake_takes_precedence_over_byok_and_demo(
+    tmp_path, monkeypatch
+):
     client = TestClient(app)
     bundle_path = _create_native_bundle(tmp_path)
-    _clear_demo_env(monkeypatch)  # fake must work with zero server config
+    _set_demo_env(monkeypatch)
+    # Neither the BYOK branch nor the demo branch may build a real gateway.
+    _forbid_real_gateway(monkeypatch)
 
     with bundle_path.open("rb") as bundle:
         response = client.post(
             "/analyze-bundle",
-            data={"fake": "true", "demo": "true"},
+            data={
+                "fake": "true",
+                "demo": "true",
+                "api_key": "byok-key",
+                "base_url": "https://llm.example/v1",
+                "model": "byok-model",
+            },
             files={"bundle": ("bundle.zip", bundle, "application/zip")},
         )
 
@@ -270,3 +313,21 @@ def test_post_analyze_bundle_fake_takes_precedence_over_demo(tmp_path, monkeypat
     data = response.json()
     assert len(data) == 1
     assert "FAKE:" in data[0]["summary"]
+
+
+def test_post_analyze_bundle_fake_works_without_any_server_config(
+    tmp_path, monkeypatch
+):
+    client = TestClient(app)
+    bundle_path = _create_native_bundle(tmp_path)
+    _clear_demo_env(monkeypatch)  # fake must work fully offline
+
+    with bundle_path.open("rb") as bundle:
+        response = client.post(
+            "/analyze-bundle",
+            data={"fake": "true"},
+            files={"bundle": ("bundle.zip", bundle, "application/zip")},
+        )
+
+    assert response.status_code == 200, response.text
+    assert "FAKE:" in response.json()[0]["summary"]
