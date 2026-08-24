@@ -28,7 +28,7 @@ app = typer.Typer()
 
 @app.callback()
 def _main() -> None:
-    """TestLens: explain why your tests failed."""
+    """testExplain: explain why your tests failed."""
 
 
 @app.command()

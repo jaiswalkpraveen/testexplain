@@ -1,6 +1,6 @@
 """LLM gateway seam.
 
-All model calls in TestLens go through the ``Gateway`` shape. The core
+All model calls in testExplain go through the ``Gateway`` shape. The core
 analysis code depends only on ``.generate()`` -- never on a concrete provider.
 That lets tests use ``FakeGateway`` (no network, no API key) while production
 uses ``AnthropicGateway`` (real Claude), with the core code unchanged.

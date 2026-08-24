@@ -32,7 +32,7 @@ from testexplain.models import FailureAnalysis
 
 load_dotenv()
 
-app = FastAPI(title="TestLens", description="Explain why your tests failed.")
+app = FastAPI(title="testExplain", description="Explain why your tests failed.")
 
 MAX_BUNDLE_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_REPORT_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -338,7 +338,7 @@ def analyze_post(request: Request, body: AnalyzeRequest) -> list[FailureAnalysis
 
 def _write_tmp_report(content: str) -> str:
     """Write report content to a temporary file and return its path."""
-    fd, path = tempfile.mkstemp(suffix=".json", prefix="testlens-")
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="testexplain-")
     owns_fd = True
     try:
         with os.fdopen(fd, "w") as f:
@@ -375,7 +375,7 @@ async def analyze_bundle(
     demo: bool = Form(default=False),
 ) -> list[FailureAnalysis]:
     """Analyze an uploaded failure-evidence ZIP bundle."""
-    fd, path = tempfile.mkstemp(suffix=".zip", prefix="testlens-")
+    fd, path = tempfile.mkstemp(suffix=".zip", prefix="testexplain-")
     owns_fd = True
     try:
         uploaded_bytes = 0
